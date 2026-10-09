@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any
 
 try:  # Normal package import (Hermes plugin loader, tests via conftest alias)
-    from .manager import BusinessModeManager, CALLBACK_PREFIX
+    from .manager import BusinessModeManager, CALLBACK_PREFIX, DRAFT_OUTPUT_RULES
     from .state import BusinessStateDB
 except ImportError:  # pragma: no cover - loaded as a bare module (no package)
     import importlib.util as _ilu
@@ -46,6 +46,7 @@ except ImportError:  # pragma: no cover - loaded as a bare module (no package)
     _state_mod = _load("state")
     BusinessModeManager = _manager_mod.BusinessModeManager
     CALLBACK_PREFIX = _manager_mod.CALLBACK_PREFIX
+    DRAFT_OUTPUT_RULES = _manager_mod.DRAFT_OUTPUT_RULES
     BusinessStateDB = _state_mod.BusinessStateDB
 
 logger = logging.getLogger(__name__)
@@ -138,12 +139,7 @@ def register(ctx: Any) -> None:
                 raise RuntimeError("Telegram bot is not connected")
             return await bot.send_message(**kwargs)
 
-        system_prompt = (
-            f"{persona}\n\n"
-            "Output only the message text. No preamble, no quotes, no "
-            "markdown headers. Keep it under 4 sentences unless the "
-            "customer asked something that genuinely needs a longer reply."
-        )
+        system_prompt = f"{persona}\n\n{DRAFT_OUTPUT_RULES}"
 
         async def _draft(prompt_text: str, customer_chat_id: str) -> str:
             messages = [

@@ -48,7 +48,7 @@ import asyncio
 import logging
 import string
 import time
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -381,11 +381,11 @@ class BusinessModeManager:
                 pass
             return
 
-        draft_text = (draft_text or "").strip().translate(_KEYBOARD_ONLY)
-        if not draft_text:
+        draft_text, skipped = postprocess_draft(draft_text)
+        if not draft_text and not skipped:
             logger.debug("Empty draft for %s — skipping", key)
             return
-        if draft_text.strip(string.punctuation + " ").lower() == "skip":
+        if skipped:
             # The model saw nothing to answer; keep a row so skips can be measured.
             self._db.create_telegram_business_draft(
                 connection_id=buf["conn_id"], owner_chat_id=buf["owner_chat_id"],
@@ -803,8 +803,23 @@ class BusinessModeManager:
 # ---------------------------------------------------------------------------
 
 
+# Appended to the owner persona to form the drafting system prompt.
+DRAFT_OUTPUT_RULES = (
+    "Output only the message text. No preamble, no quotes, no "
+    "markdown headers. Keep it under 4 sentences unless the "
+    "customer asked something that genuinely needs a longer reply."
+)
+
 # The owner types on a phone keyboard: typography the model likes never reaches a draft.
 _KEYBOARD_ONLY = str.maketrans({"—": "-", "–": "-", "…": "...", "«": '"', "»": '"', "“": '"', "”": '"'})
+
+
+def postprocess_draft(text: Optional[str]) -> Tuple[str, bool]:
+    """Model output -> (draft text, skipped). ``SKIP`` (any case/punctuation) means no reply is needed."""
+    text = (text or "").strip().translate(_KEYBOARD_ONLY)
+    if text.strip(string.punctuation + " ").lower() == "skip":
+        return "", True
+    return text, False
 
 _MEDIA_LABELS = (
     ("photo", "[photo]"), ("voice", "[voice message]"), ("video_note", "[video message]"),
