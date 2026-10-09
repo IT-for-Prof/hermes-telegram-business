@@ -273,7 +273,7 @@ class BusinessModeManager:
             # The owner answered by hand (even while drafting is paused): drop the
             # queued/pending draft so a stale Send button can't double-reply.
             self._drop_queued_draft(key, str(conn_id), str(customer_chat_id),
-                                    owner_text=None if muted else text or None)
+                                    owner_text=None if muted else text)
         if not muted:  # /biz off chats are neither drafted nor logged
             self._db.log_business_message(
                 str(conn_id), str(customer_chat_id),
@@ -390,7 +390,7 @@ class BusinessModeManager:
             self._db.create_telegram_business_draft(
                 connection_id=buf["conn_id"], owner_chat_id=buf["owner_chat_id"],
                 customer_chat_id=buf["customer_chat_id"], customer_msg_id=buf["customer_msg_id"] or None,
-                customer_text=customer_text, draft_text="", ttl_seconds=0, status="skipped",
+                customer_text=customer_text, draft_text="", status="skipped",
             )
             return
 

@@ -215,11 +215,11 @@ class BusinessStateDB:
         ttl_seconds: float = 86400.0,
         status: str = "pending",
     ) -> int:
-        """Insert a draft row (``pending``, or ``skipped`` = the model saw no need to reply) and return its id.
+        """Insert a pending draft row and return its draft_id.
 
-        A new pending draft marks prior pending drafts for the same
-        (connection, customer_chat) superseded so only one Send button is ever
-        live per conversation; a skipped one leaves them alone.
+        Any prior pending drafts for the same (connection, customer_chat)
+        are marked superseded so only one Send button is ever live per
+        conversation. ``status="skipped"`` (no reply needed) leaves them alone.
         """
         now = time.time()
         with self._lock:

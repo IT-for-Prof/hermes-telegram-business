@@ -992,7 +992,7 @@ def test_draft_dm_shows_mute_command():
 
 
 class TestReplyCapture:
-    """U1: the owner's real reply to a draft he did not use becomes the draft's final_sent_text."""
+    """The owner's real reply to a draft he did not use becomes the draft's final_sent_text."""
 
     @staticmethod
     def _rows(db):
@@ -1070,7 +1070,7 @@ class TestReplyCapture:
 
 
 class TestDraftOutputCleanup:
-    """U3: forbidden characters never reach a draft; SKIP means no draft but a counted row."""
+    """Forbidden characters never reach a draft; SKIP means no draft but a counted row."""
 
     @pytest.mark.asyncio
     async def test_typographic_characters_are_replaced(self, db):
