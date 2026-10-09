@@ -260,6 +260,8 @@ class BusinessModeManager:
         key = f"{conn_id}:{customer_chat_id}"
         by_bot = getattr(message, "sender_business_bot", None) is not None
         sender = getattr(message, "from_user", None)
+        if getattr(sender, "is_bot", False):
+            return  # chats with bots — incl. this bot's own DMs to the owner — are not conversations
         by_owner = by_bot or (sender is not None and str(getattr(sender, "id", "")) == str(conn.get("owner_user_id")))
         # Captions on media count too — they're often the only part the customer typed.
         text = (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()

@@ -78,6 +78,16 @@ def _plugin_config(ctx: Any) -> dict:
               max_customer_text_chars: 4000
               owner_persona: "..."
     """
+    # Host API first: plugins.entries.<id>.settings.<key> (or the legacy .config subtree).
+    getter = getattr(ctx, "get_config", None)
+    if callable(getter):
+        try:
+            keys = ("debounce_seconds", "draft_ttl_hours", "max_customer_text_chars", "owner_persona")
+            found = {k: v for k in keys if (v := getter(k)) is not None}
+            if found:
+                return found
+        except Exception as exc:
+            logger.warning("telegram-business: ctx.get_config failed: %s", exc)
     try:
         import yaml
         cfg_path = _hermes_home() / "config.yaml"
@@ -88,7 +98,7 @@ def _plugin_config(ctx: Any) -> dict:
             if isinstance(block, dict):
                 return block
     except Exception as exc:  # pragma: no cover - defensive
-        logger.debug("telegram-business: config read failed: %s", exc)
+        logger.warning("telegram-business: config read failed: %s", exc)
     return {}
 
 
@@ -98,6 +108,8 @@ def register(ctx: Any) -> None:
     ttl_hours = float(cfg.get("draft_ttl_hours", 24.0))
     max_chars = int(cfg.get("max_customer_text_chars", 4000))
     persona = str(cfg.get("owner_persona") or _DEFAULT_PERSONA)
+    logger.info("telegram-business: persona from %s (%d chars)",
+                "config" if cfg.get("owner_persona") else "BUILT-IN DEFAULT", len(persona))
 
     # Deferred singletons — constructed on first connect so import stays light.
     _state: dict = {"db": None, "manager": None}

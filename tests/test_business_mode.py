@@ -832,3 +832,16 @@ class TestConversationContext:
             db.append_business_chat_log("conn1", "200", "Carol", f"m{i}", keep=20)
         log = db.get_business_chat_log("conn1", "200")
         assert [r["text"] for r in log] == [f"m{i}" for i in range(5, 25)]
+
+
+class TestBotChats:
+    @pytest.mark.asyncio
+    async def test_messages_from_bots_are_ignored(self, db):
+        mgr, sender, prompts = _capturing_manager(db)
+        await mgr.handle_connection_update(_fake_business_connection())
+        sender.calls.clear()
+        msg = _fake_business_message(customer_chat_id=8555, customer_id=8555, text="⚠️ Hermes is shutting down")
+        msg.from_user.is_bot = True
+        await mgr.handle_business_message(msg)
+        assert prompts == [] and sender.calls == []
+        assert db.get_business_chat_log("conn1", "8555") == []
