@@ -283,7 +283,7 @@ class BusinessStateDB:
     def purge_business_chat_log(self, connection_id: str, customer_chat_id: Optional[str] = None) -> None:
         """Forget a chat's log and its draft texts (or those of every chat of a connection).
 
-        Pending drafts keep their draft text so a live Send button still works.
+        A pending draft is expired too: the chat is muted or the connection is gone.
         """
         where, args = "connection_id = ?", (str(connection_id),)
         if customer_chat_id is not None:
@@ -291,19 +291,20 @@ class BusinessStateDB:
         with self._lock:
             self._conn.execute(f"DELETE FROM business_chat_log WHERE {where}", args)
             self._conn.execute(
-                "UPDATE business_drafts SET customer_text = '', final_sent_text = NULL, "
-                f"draft_text = CASE WHEN status = 'pending' THEN draft_text ELSE '' END WHERE {where}", args)
+                "UPDATE business_drafts SET customer_text = '', draft_text = '', final_sent_text = NULL, "
+                f"status = CASE WHEN status = 'pending' THEN 'expired' ELSE status END WHERE {where}", args)
             self._conn.commit()
 
     def supersede_pending_telegram_business_drafts(
         self, connection_id: str, customer_chat_id: str, owner_text: Optional[str] = None,
     ) -> None:
-        """Retire the live draft of one conversation: the owner answered by hand.
+        """Retire the live draft of one conversation: the owner answered by hand (status ``replied``).
 
         ``owner_text`` (his reply) is kept as the draft's ``final_sent_text``, a
         "draft -> what he actually wrote" example, but only on drafts that have
-        not expired. Without a pending draft it extends the reply recorded in the
-        last 120 s, so a reply typed as several messages stays whole.
+        not expired. Without a pending draft it extends the latest reply recorded
+        in the last 120 s, unless the contact has written since, so a reply typed
+        as several messages stays whole.
         """
         now, conn_id, chat_id = time.time(), str(connection_id), str(customer_chat_id)
         with self._lock:
@@ -316,19 +317,24 @@ class BusinessStateDB:
                 if not captured:
                     self._conn.execute(
                         "UPDATE business_drafts SET final_sent_text = final_sent_text || char(10) || ? "
-                        "WHERE connection_id = ? AND customer_chat_id = ? AND status = 'superseded' "
-                        "AND final_sent_text IS NOT NULL AND updated_at >= ?",
+                        "WHERE draft_id = (SELECT max(d.draft_id) FROM business_drafts d "
+                        "  WHERE d.connection_id = ? AND d.customer_chat_id = ? AND d.status = 'replied' "
+                        "  AND d.final_sent_text IS NOT NULL AND d.updated_at >= ? AND NOT EXISTS ("
+                        "    SELECT 1 FROM business_chat_log l WHERE l.connection_id = d.connection_id "
+                        "    AND l.customer_chat_id = d.customer_chat_id AND l.is_owner = 0 "
+                        "    AND l.created_at > d.updated_at))",
                         (owner_text, conn_id, chat_id, now - 120),
                     )
-            self._supersede_pending(now, conn_id, chat_id)
+            self._supersede_pending(now, conn_id, chat_id, status="replied")
             self._conn.commit()
 
-    def _supersede_pending(self, now: float, connection_id: str, customer_chat_id: str) -> None:
+    def _supersede_pending(self, now: float, connection_id: str, customer_chat_id: str,
+                           status: str = "superseded") -> None:
         """Caller holds ``self._lock`` and commits."""
         self._conn.execute(
-            "UPDATE business_drafts SET status = 'superseded', updated_at = ? "
+            "UPDATE business_drafts SET status = ?, updated_at = ? "
             "WHERE connection_id = ? AND customer_chat_id = ? AND status = 'pending'",
-            (now, str(connection_id), str(customer_chat_id)),
+            (status, now, str(connection_id), str(customer_chat_id)),
         )
 
     def get_telegram_business_draft(self, draft_id: int) -> Optional[Dict[str, Any]]:

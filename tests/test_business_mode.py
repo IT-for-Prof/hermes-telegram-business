@@ -1001,12 +1001,12 @@ class TestReplyCapture:
         ).fetchall()
 
     @pytest.mark.asyncio
-    async def test_owner_reply_is_stored_on_superseded_draft(self, db):
+    async def test_owner_reply_is_stored_on_the_replied_draft(self, db):
         mgr, sender = _make_manager(db)
         await mgr.handle_connection_update(_fake_business_connection())
         await mgr.handle_business_message(_fake_business_message(text="Free on Friday?"))
         await mgr.handle_business_message(_owner_msg("да, после 3"))
-        assert [tuple(r) for r in self._rows(db)] == [("superseded", "Free on Friday?", "Draft reply!", "да, после 3")]
+        assert [tuple(r) for r in self._rows(db)] == [("replied", "Free on Friday?", "Draft reply!", "да, после 3")]
 
     @pytest.mark.asyncio
     async def test_owner_burst_is_appended(self, db):
@@ -1026,7 +1026,7 @@ class TestReplyCapture:
         voice.voice = object()
         await mgr.handle_business_message(voice)
         row = self._rows(db)[0]
-        assert row["status"] == "superseded" and row["final_sent_text"] is None
+        assert row["status"] == "replied" and row["final_sent_text"] is None
 
     @pytest.mark.asyncio
     async def test_contact_superseded_draft_stores_nothing(self, db):
@@ -1045,7 +1045,7 @@ class TestReplyCapture:
         db._conn.execute("UPDATE business_drafts SET expires_at = 0 WHERE draft_id = ?", (did,))
         db.supersede_pending_telegram_business_drafts("c1", "200", owner_text="much later, other topic")
         row = db.get_telegram_business_draft(did)
-        assert row["status"] == "superseded" and row["final_sent_text"] is None
+        assert row["status"] == "replied" and row["final_sent_text"] is None
 
     @pytest.mark.asyncio
     async def test_muted_chat_reply_stores_nothing_and_purge_clears_texts(self, db):
@@ -1054,10 +1054,54 @@ class TestReplyCapture:
         await mgr.handle_business_message(_fake_business_message(text="Free on Friday?"))
         await mgr.handle_business_message(_owner_msg("да"))
         await mgr.handle_biz_command(owner_user_id="42", owner_chat_id="100", args=["off", "200"])
-        assert [tuple(r) for r in self._rows(db)] == [("superseded", "", "", None)]
+        assert [tuple(r) for r in self._rows(db)] == [("replied", "", "", None)]
         await mgr.handle_business_message(_fake_business_message(text="still there?", msg_id=3))
         await mgr.handle_business_message(_owner_msg("нет", msg_id=503))
         assert all(r["final_sent_text"] is None for r in self._rows(db))
+
+    @pytest.mark.asyncio
+    async def test_follow_up_extends_only_the_latest_reply(self, db):
+        mgr, sender = _make_manager(db)
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message(text="A?", msg_id=1))
+        await mgr.handle_business_message(_owner_msg("r1", msg_id=501))
+        await mgr.handle_business_message(_fake_business_message(text="B?", msg_id=2))
+        await mgr.handle_business_message(_owner_msg("r2", msg_id=502))
+        await mgr.handle_business_message(_owner_msg("r3", msg_id=503))
+        assert [r["final_sent_text"] for r in self._rows(db)] == ["r1", "r2\nr3"]
+
+    @pytest.mark.asyncio
+    async def test_follow_up_after_a_contact_turn_is_not_appended(self, db):
+        mgr, sender = _make_manager(db)
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message(text="A?", msg_id=1))
+        await mgr.handle_business_message(_owner_msg("r1", msg_id=501))
+        db.set_telegram_business_auto_draft("conn1", auto_draft=False)  # Q2 logged, no draft
+        await mgr.handle_business_message(_fake_business_message(text="Q2?", msg_id=2))
+        await mgr.handle_business_message(_owner_msg("answer to Q2", msg_id=502))
+        assert [r["final_sent_text"] for r in self._rows(db)] == ["r1"]
+
+    def test_follow_up_after_the_window_is_not_appended(self, db):
+        db.upsert_telegram_business_connection(
+            connection_id="c1", owner_user_id="42", owner_chat_id="100", can_reply=True, is_enabled=True)
+        did = db.create_telegram_business_draft(
+            connection_id="c1", owner_chat_id="100", customer_chat_id="200",
+            customer_msg_id="m1", customer_text="hi", draft_text="hello")
+        db.supersede_pending_telegram_business_drafts("c1", "200", owner_text="r1")
+        db._conn.execute("UPDATE business_drafts SET updated_at = updated_at - 200 WHERE draft_id = ?", (did,))
+        db.supersede_pending_telegram_business_drafts("c1", "200", owner_text="much later")
+        assert db.get_telegram_business_draft(did)["final_sent_text"] == "r1"
+
+    @pytest.mark.asyncio
+    async def test_biz_off_expires_the_pending_draft_and_clears_its_text(self, db):
+        mgr, sender = _make_manager(db)
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message(text="A?", msg_id=1, customer_chat_id=200))
+        await mgr.handle_business_message(_fake_business_message(text="B?", msg_id=2, customer_chat_id=300))
+        await mgr.handle_biz_command(owner_user_id="42", owner_chat_id="100", args=["off", "200"])
+        rows = db._conn.execute(
+            "SELECT customer_chat_id, status, customer_text, draft_text FROM business_drafts ORDER BY draft_id").fetchall()
+        assert [tuple(r) for r in rows] == [("200", "expired", "", ""), ("300", "pending", "B?", "Draft reply!")]
 
     @pytest.mark.asyncio
     async def test_disconnect_clears_draft_texts(self, db):
@@ -1066,7 +1110,7 @@ class TestReplyCapture:
         await mgr.handle_business_message(_fake_business_message(text="Free on Friday?"))
         await mgr.handle_business_message(_owner_msg("да"))
         await mgr.handle_connection_update(_fake_business_connection(is_enabled=False))
-        assert [tuple(r) for r in self._rows(db)] == [("superseded", "", "", None)]
+        assert [tuple(r) for r in self._rows(db)] == [("replied", "", "", None)]
 
 
 class TestDraftOutputCleanup:
