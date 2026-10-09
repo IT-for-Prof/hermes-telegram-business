@@ -213,28 +213,30 @@ class BusinessStateDB:
         customer_text: str,
         draft_text: str,
         ttl_seconds: float = 86400.0,
+        status: str = "pending",
     ) -> int:
-        """Insert a pending draft row and return its draft_id.
+        """Insert a draft row (``pending``, or ``skipped`` = the model saw no need to reply) and return its id.
 
-        Any prior pending drafts for the same (connection, customer_chat)
-        are marked superseded so only one Send button is ever live per
-        conversation.
+        A new pending draft marks prior pending drafts for the same
+        (connection, customer_chat) superseded so only one Send button is ever
+        live per conversation; a skipped one leaves them alone.
         """
         now = time.time()
         with self._lock:
-            self._supersede_pending(now, connection_id, customer_chat_id)
+            if status == "pending":
+                self._supersede_pending(now, connection_id, customer_chat_id)
             cur = self._conn.execute(
                 """
                 INSERT INTO business_drafts (
                     connection_id, owner_chat_id, customer_chat_id,
                     customer_msg_id, customer_text, draft_text,
                     status, created_at, updated_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(connection_id), str(owner_chat_id), str(customer_chat_id),
                     str(customer_msg_id) if customer_msg_id is not None else None,
-                    customer_text, draft_text,
+                    customer_text, draft_text, status,
                     now, now, now + max(60.0, float(ttl_seconds)),
                 ),
             )
@@ -279,23 +281,46 @@ class BusinessStateDB:
         return [dict(r) for r in rows]
 
     def purge_business_chat_log(self, connection_id: str, customer_chat_id: Optional[str] = None) -> None:
-        """Forget a chat's log (or every chat of a connection)."""
+        """Forget a chat's log and its draft texts (or those of every chat of a connection).
+
+        Pending drafts keep their draft text so a live Send button still works.
+        """
+        where, args = "connection_id = ?", (str(connection_id),)
+        if customer_chat_id is not None:
+            where, args = "connection_id = ? AND customer_chat_id = ?", args + (str(customer_chat_id),)
         with self._lock:
-            if customer_chat_id is None:
-                self._conn.execute("DELETE FROM business_chat_log WHERE connection_id = ?",
-                                   (str(connection_id),))
-            else:
-                self._conn.execute(
-                    "DELETE FROM business_chat_log WHERE connection_id = ? AND customer_chat_id = ?",
-                    (str(connection_id), str(customer_chat_id)))
+            self._conn.execute(f"DELETE FROM business_chat_log WHERE {where}", args)
+            self._conn.execute(
+                "UPDATE business_drafts SET customer_text = '', final_sent_text = NULL, "
+                f"draft_text = CASE WHEN status = 'pending' THEN draft_text ELSE '' END WHERE {where}", args)
             self._conn.commit()
 
     def supersede_pending_telegram_business_drafts(
-        self, connection_id: str, customer_chat_id: str,
+        self, connection_id: str, customer_chat_id: str, owner_text: Optional[str] = None,
     ) -> None:
-        """Retire the live draft of one conversation (the owner answered by hand)."""
+        """Retire the live draft of one conversation: the owner answered by hand.
+
+        ``owner_text`` (his reply) is kept as the draft's ``final_sent_text``, a
+        "draft -> what he actually wrote" example, but only on drafts that have
+        not expired. Without a pending draft it extends the reply recorded in the
+        last 120 s, so a reply typed as several messages stays whole.
+        """
+        now, conn_id, chat_id = time.time(), str(connection_id), str(customer_chat_id)
         with self._lock:
-            self._supersede_pending(time.time(), connection_id, customer_chat_id)
+            if owner_text:
+                captured = self._conn.execute(
+                    "UPDATE business_drafts SET final_sent_text = ? WHERE connection_id = ? "
+                    "AND customer_chat_id = ? AND status = 'pending' AND expires_at >= ?",
+                    (owner_text, conn_id, chat_id, now),
+                ).rowcount
+                if not captured:
+                    self._conn.execute(
+                        "UPDATE business_drafts SET final_sent_text = final_sent_text || char(10) || ? "
+                        "WHERE connection_id = ? AND customer_chat_id = ? AND status = 'superseded' "
+                        "AND final_sent_text IS NOT NULL AND updated_at >= ?",
+                        (owner_text, conn_id, chat_id, now - 120),
+                    )
+            self._supersede_pending(now, conn_id, chat_id)
             self._conn.commit()
 
     def _supersede_pending(self, now: float, connection_id: str, customer_chat_id: str) -> None:

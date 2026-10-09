@@ -989,3 +989,122 @@ def test_draft_dm_shows_mute_command():
     body = BusinessModeManager._render_draft_owner_message(
         customer_name="Ann", customer_chat_id="777", customer_text="hi", draft_text="hello")
     assert body.endswith("Mute this chat: /biz off 777")
+
+
+class TestReplyCapture:
+    """U1: the owner's real reply to a draft he did not use becomes the draft's final_sent_text."""
+
+    @staticmethod
+    def _rows(db):
+        return db._conn.execute(
+            "SELECT status, customer_text, draft_text, final_sent_text FROM business_drafts ORDER BY draft_id"
+        ).fetchall()
+
+    @pytest.mark.asyncio
+    async def test_owner_reply_is_stored_on_superseded_draft(self, db):
+        mgr, sender = _make_manager(db)
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message(text="Free on Friday?"))
+        await mgr.handle_business_message(_owner_msg("да, после 3"))
+        assert [tuple(r) for r in self._rows(db)] == [("superseded", "Free on Friday?", "Draft reply!", "да, после 3")]
+
+    @pytest.mark.asyncio
+    async def test_owner_burst_is_appended(self, db):
+        mgr, sender = _make_manager(db)
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message(text="Free on Friday?"))
+        await mgr.handle_business_message(_owner_msg("Привет!", msg_id=501))
+        await mgr.handle_business_message(_owner_msg("да", msg_id=502))
+        assert self._rows(db)[0]["final_sent_text"] == "Привет!\nда"
+
+    @pytest.mark.asyncio
+    async def test_media_reply_stores_nothing(self, db):
+        mgr, sender = _make_manager(db)
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message(text="Free on Friday?"))
+        voice = _owner_msg(None)
+        voice.voice = object()
+        await mgr.handle_business_message(voice)
+        row = self._rows(db)[0]
+        assert row["status"] == "superseded" and row["final_sent_text"] is None
+
+    @pytest.mark.asyncio
+    async def test_contact_superseded_draft_stores_nothing(self, db):
+        mgr, sender = _make_manager(db)
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message(text="one", msg_id=1))
+        await mgr.handle_business_message(_fake_business_message(text="two", msg_id=2))
+        assert [r["final_sent_text"] for r in self._rows(db)] == [None, None]
+
+    def test_stale_draft_stores_nothing(self, db):
+        db.upsert_telegram_business_connection(
+            connection_id="c1", owner_user_id="42", owner_chat_id="100", can_reply=True, is_enabled=True)
+        did = db.create_telegram_business_draft(
+            connection_id="c1", owner_chat_id="100", customer_chat_id="200",
+            customer_msg_id="m1", customer_text="hi", draft_text="hello")
+        db._conn.execute("UPDATE business_drafts SET expires_at = 0 WHERE draft_id = ?", (did,))
+        db.supersede_pending_telegram_business_drafts("c1", "200", owner_text="much later, other topic")
+        row = db.get_telegram_business_draft(did)
+        assert row["status"] == "superseded" and row["final_sent_text"] is None
+
+    @pytest.mark.asyncio
+    async def test_muted_chat_reply_stores_nothing_and_purge_clears_texts(self, db):
+        mgr, sender = _make_manager(db)
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message(text="Free on Friday?"))
+        await mgr.handle_business_message(_owner_msg("да"))
+        await mgr.handle_biz_command(owner_user_id="42", owner_chat_id="100", args=["off", "200"])
+        assert [tuple(r) for r in self._rows(db)] == [("superseded", "", "", None)]
+        await mgr.handle_business_message(_fake_business_message(text="still there?", msg_id=3))
+        await mgr.handle_business_message(_owner_msg("нет", msg_id=503))
+        assert all(r["final_sent_text"] is None for r in self._rows(db))
+
+    @pytest.mark.asyncio
+    async def test_disconnect_clears_draft_texts(self, db):
+        mgr, sender = _make_manager(db)
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message(text="Free on Friday?"))
+        await mgr.handle_business_message(_owner_msg("да"))
+        await mgr.handle_connection_update(_fake_business_connection(is_enabled=False))
+        assert [tuple(r) for r in self._rows(db)] == [("superseded", "", "", None)]
+
+
+class TestDraftOutputCleanup:
+    """U3: forbidden characters never reach a draft; SKIP means no draft but a counted row."""
+
+    @pytest.mark.asyncio
+    async def test_typographic_characters_are_replaced(self, db):
+        mgr, sender = _make_manager(db, draft_text="Ок — завтра… «да» “нет” – ладно")
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message(text="?"))
+        draft = db.get_pending_telegram_business_drafts_for_owner("100")[0]
+        assert draft["draft_text"] == 'Ок - завтра... "да" "нет" - ладно'
+
+    @pytest.mark.parametrize("output", ["SKIP", "skip.", " Skip ", "SKIP!"])
+    @pytest.mark.asyncio
+    async def test_skip_records_row_without_dm(self, db, output):
+        mgr, sender = _make_manager(db, draft_text=output)
+        await mgr.handle_connection_update(_fake_business_connection())
+        sender.calls.clear()
+        await mgr.handle_business_message(_fake_business_message(text="спасибо"))
+        assert sender.calls == []
+        rows = db._conn.execute("SELECT status FROM business_drafts").fetchall()
+        assert [r["status"] for r in rows] == ["skipped"]
+
+    @pytest.mark.asyncio
+    async def test_skip_keeps_earlier_pending_draft(self, db):
+        mgr, sender = _make_manager(db)
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message(text="Free on Friday?", msg_id=1))
+        mgr._draft_generator = lambda *_: asyncio.sleep(0, result="SKIP")
+        await mgr.handle_business_message(_fake_business_message(text="спасибо", msg_id=2))
+        pending = db.get_pending_telegram_business_drafts_for_owner("100")
+        assert [d["customer_text"] for d in pending] == ["Free on Friday?"]
+
+    @pytest.mark.parametrize("text", ["Skip it, I'll call", "skipping today"])
+    @pytest.mark.asyncio
+    async def test_text_mentioning_skip_is_a_normal_draft(self, db, text):
+        mgr, sender = _make_manager(db, draft_text=text)
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message(text="?"))
+        assert db.get_pending_telegram_business_drafts_for_owner("100")[0]["draft_text"] == text

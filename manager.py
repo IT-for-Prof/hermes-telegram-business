@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import string
 import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
@@ -271,7 +272,8 @@ class BusinessModeManager:
         if by_owner and not by_bot and not edited:
             # The owner answered by hand (even while drafting is paused): drop the
             # queued/pending draft so a stale Send button can't double-reply.
-            self._drop_queued_draft(key, str(conn_id), str(customer_chat_id))
+            self._drop_queued_draft(key, str(conn_id), str(customer_chat_id),
+                                    owner_text=None if muted else text or None)
         if not muted:  # /biz off chats are neither drafted nor logged
             self._db.log_business_message(
                 str(conn_id), str(customer_chat_id),
@@ -306,11 +308,12 @@ class BusinessModeManager:
                 self._debounce_then_draft(key)
             )
 
-    def _drop_queued_draft(self, key: str, conn_id: str, customer_chat_id: str) -> None:
+    def _drop_queued_draft(self, key: str, conn_id: str, customer_chat_id: str,
+                           owner_text: Optional[str] = None) -> None:
         """Cancel the chat's queued draft, supersede its pending one, end any Edit capture of it."""
         self._cancel_debounce(key)
         self._debounce_buffers.pop(key, None)
-        self._db.supersede_pending_telegram_business_drafts(conn_id, customer_chat_id)
+        self._db.supersede_pending_telegram_business_drafts(conn_id, customer_chat_id, owner_text)
         for owner_chat, draft_id in list(self._edit_capture.items()):
             draft = self._db.get_telegram_business_draft(draft_id)
             if draft and draft["connection_id"] == conn_id and draft["customer_chat_id"] == customer_chat_id:
@@ -378,9 +381,17 @@ class BusinessModeManager:
                 pass
             return
 
-        draft_text = (draft_text or "").strip()
+        draft_text = (draft_text or "").strip().translate(_KEYBOARD_ONLY)
         if not draft_text:
             logger.debug("Empty draft for %s — skipping", key)
+            return
+        if draft_text.strip(string.punctuation + " ").lower() == "skip":
+            # The model saw nothing to answer; keep a row so skips can be measured.
+            self._db.create_telegram_business_draft(
+                connection_id=buf["conn_id"], owner_chat_id=buf["owner_chat_id"],
+                customer_chat_id=buf["customer_chat_id"], customer_msg_id=buf["customer_msg_id"] or None,
+                customer_text=customer_text, draft_text="", ttl_seconds=0, status="skipped",
+            )
             return
 
         draft_id = self._db.create_telegram_business_draft(
@@ -791,6 +802,9 @@ class BusinessModeManager:
 # Helpers
 # ---------------------------------------------------------------------------
 
+
+# The owner types on a phone keyboard: typography the model likes never reaches a draft.
+_KEYBOARD_ONLY = str.maketrans({"—": "-", "–": "-", "…": "...", "«": '"', "»": '"', "“": '"', "”": '"'})
 
 _MEDIA_LABELS = (
     ("photo", "[photo]"), ("voice", "[voice message]"), ("video_note", "[video message]"),
