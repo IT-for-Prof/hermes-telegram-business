@@ -92,7 +92,7 @@ ONBOARDING_MESSAGE = (
 
 # Generates a draft reply text for a given customer message.
 # Returns the draft text, or raises on failure.
-DraftGenerator = Callable[[str, str], Awaitable[str]]  # (customer_text, customer_chat_id) -> draft
+DraftGenerator = Callable[[str, str], Awaitable[str]]  # (conversation prompt, customer_chat_id) -> draft
 
 # Sends a message to a chat. For owner DMs, business_connection_id is None.
 # For customer chats reached via business mode, business_connection_id is set.
@@ -254,47 +254,49 @@ class BusinessModeManager:
             logger.debug("Customer chat %s paused; skipping draft", customer_chat_id)
             return
 
-        # Telegram delivers both sides of a Business chat (upstream issue #3): only the
-        # other party gets drafts. Ignore the bot's own sends; a message the owner typed
-        # by hand answers the conversation, so drop its queued/pending draft — a stale
-        # Send button would otherwise double-reply.
-        if getattr(message, "sender_business_bot", None) is not None:
-            return
+        # Telegram delivers both sides of a Business chat (upstream issue #3). Every
+        # message goes into a short per-chat log (the draft's only context — bots can't
+        # read history); only the other party's text gets a draft.
+        key = f"{conn_id}:{customer_chat_id}"
+        by_bot = getattr(message, "sender_business_bot", None) is not None
         sender = getattr(message, "from_user", None)
-        if sender is not None and str(getattr(sender, "id", "")) == str(conn.get("owner_user_id")):
-            key = f"{conn_id}:{customer_chat_id}"
+        by_owner = by_bot or (sender is not None and str(getattr(sender, "id", "")) == str(conn.get("owner_user_id")))
+        # Captions on media count too — they're often the only part the customer typed.
+        text = (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
+        if len(text) > self._max_customer_text_chars:
+            text = text[: self._max_customer_text_chars]
+        self._db.append_business_chat_log(
+            str(conn_id), str(customer_chat_id),
+            "Owner" if by_owner else _customer_display_name(message),
+            text or _media_placeholder(message),
+        )
+        if by_bot:
+            return  # our own Send/Edit delivery echoing back
+        if by_owner:
+            # The owner answered by hand: drop the queued/pending draft so a stale
+            # Send button can't double-reply.
             task = self._debounce_tasks.pop(key, None)
             if task is not None and not task.done():
                 task.cancel()
             self._debounce_buffers.pop(key, None)
             self._db.supersede_pending_telegram_business_drafts(str(conn_id), str(customer_chat_id))
             return
-
-        # Pull text. Captions on media count too — they're often the only
-        # part the customer typed.
-        text = (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
         if not text:
-            # Pure media without caption — out of scope for v1 (no vision pipeline).
-            return
-        if len(text) > self._max_customer_text_chars:
-            text = text[: self._max_customer_text_chars]
+            return  # pure media: logged as context, no vision pipeline to draft from
 
-        key = f"{conn_id}:{customer_chat_id}"
-
-        # Cancel any in-flight debounce for this (connection, customer chat) so
-        # rapid bursts coalesce into a single draft against the latest text.
+        # Restart the debounce timer; the burst accumulates so no part is lost.
         prior = self._debounce_tasks.pop(key, None)
         if prior is not None and not prior.done():
             prior.cancel()
-
-        # Buffer the latest message info — the timer will read this at fire time.
+        parts = self._debounce_buffers.get(key, {}).get("parts", []) + [text]
         self._debounce_buffers[key] = {
             "conn_id": str(conn_id),
             "owner_chat_id": str(conn.get("owner_chat_id")),
             "customer_chat_id": str(customer_chat_id),
             "customer_msg_id": str(getattr(message, "message_id", "") or ""),
-            "customer_text": text,
+            "customer_text": "\n".join(parts)[-self._max_customer_text_chars:],
             "customer_name": _customer_display_name(message),
+            "parts": parts,
         }
 
         # Schedule the actual draft.  If debounce is zero (test mode), fire
@@ -329,10 +331,10 @@ class BusinessModeManager:
         if buf["customer_chat_id"] in (conn.get("paused_chats") or []):
             return
 
+        log = self._db.get_business_chat_log(buf["conn_id"], buf["customer_chat_id"])
+        prompt = _render_conversation(log, buf["customer_name"]) if log else buf["customer_text"]
         try:
-            draft_text = await self._draft_generator(
-                buf["customer_text"], buf["customer_chat_id"]
-            )
+            draft_text = await self._draft_generator(prompt, buf["customer_chat_id"])
         except Exception as exc:
             logger.exception("Business-mode draft generator failed: %s", exc)
             try:
@@ -754,6 +756,27 @@ class BusinessModeManager:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+_MEDIA_LABELS = (
+    ("photo", "[photo]"), ("voice", "[voice message]"), ("video_note", "[video message]"),
+    ("video", "[video]"), ("audio", "[audio]"), ("document", "[document]"),
+    ("sticker", "[sticker]"), ("location", "[location]"), ("contact", "[contact]"),
+)
+
+
+def _media_placeholder(message: Any) -> str:
+    return next((label for attr, label in _MEDIA_LABELS if getattr(message, attr, None)), "[media]")
+
+
+def _render_conversation(log: List[Dict[str, Any]], customer_name: str) -> str:
+    """The draft prompt: the recent conversation, oldest first."""
+    lines = "\n".join(f"{r['author']}: {r['text']}" for r in log)
+    return (
+        'Conversation so far, oldest first. "Owner" is the account owner you are drafting for.\n\n'
+        f"{lines}\n\n"
+        f"Draft the owner's reply to the latest message(s) from {customer_name}."
+    )
 
 
 def _customer_display_name(message: Any) -> str:

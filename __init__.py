@@ -262,13 +262,14 @@ def register(ctx: Any) -> None:
 
         # Connection lifecycle (established / edited / ended).
         application.add_handler(BusinessConnectionHandler(_on_business_connection))
-        # Incoming + edited customer messages (text only for v1).
+        # Every Business message, both sides: media without text still goes into
+        # the chat log as context ("[photo]"); only the other party's text is drafted.
         application.add_handler(MessageHandler(
-            filters.UpdateType.BUSINESS_MESSAGE & filters.TEXT,
+            filters.UpdateType.BUSINESS_MESSAGE,
             _on_business_message,
         ))
         application.add_handler(MessageHandler(
-            filters.UpdateType.EDITED_BUSINESS_MESSAGE & filters.TEXT,
+            filters.UpdateType.EDITED_BUSINESS_MESSAGE & (filters.TEXT | filters.CAPTION),
             _on_business_message,
         ))
         # Draft approval buttons — pattern-scoped so every other callback

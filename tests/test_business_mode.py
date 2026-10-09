@@ -757,3 +757,78 @@ class TestOwnerAndBotMessages:
         await mgr.handle_business_message(_fake_business_message(customer_chat_id=200, text="ping"))
         await mgr.handle_business_message(self._owner_message(customer_chat_id=300))
         assert len(db.get_pending_telegram_business_drafts_for_owner("100")) == 1
+
+
+def _capturing_manager(db, *, debounce=0.0):
+    """Manager whose draft generator records the prompt text it was given."""
+    from telegram_business_plugin.manager import BusinessModeManager
+
+    prompts: List[str] = []
+
+    async def _draft(prompt_text: str, customer_chat_id: str) -> str:
+        prompts.append(prompt_text)
+        return "draft"
+
+    sender = _SentRecorder()
+    mgr = BusinessModeManager(session_db=db, send_message=sender,
+                              draft_generator=_draft, debounce_seconds=debounce)
+    return mgr, sender, prompts
+
+
+def _owner_msg(text, *, customer_chat_id=200, msg_id=500):
+    return _fake_business_message(customer_chat_id=customer_chat_id, customer_id=42,
+                                  text=text, msg_id=msg_id)
+
+
+class TestConversationContext:
+    @pytest.mark.asyncio
+    async def test_burst_keeps_every_part(self, db):
+        mgr, sender, prompts = _capturing_manager(db, debounce=0.05)
+        await mgr.handle_connection_update(_fake_business_connection())
+        sender.calls.clear()
+        for i, t in enumerate(["I'm in Limassol", "near the marina", "where shall we meet?"]):
+            await mgr.handle_business_message(_fake_business_message(text=t, msg_id=i))
+        await asyncio.sleep(0.2)
+        assert len(prompts) == 1
+        for t in ("I'm in Limassol", "near the marina", "where shall we meet?"):
+            assert t in prompts[0]
+        dm = [c for c in sender.calls if c.get("chat_id") == 100][0]["text"]
+        assert "I'm in Limassol" in dm and "where shall we meet?" in dm
+
+    @pytest.mark.asyncio
+    async def test_prompt_includes_owner_replies(self, db):
+        mgr, sender, prompts = _capturing_manager(db)
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message(text="Free on Friday?", msg_id=1))
+        await mgr.handle_business_message(_owner_msg("yes, after 3"))
+        await mgr.handle_business_message(_fake_business_message(text="where then?", msg_id=2))
+        last = prompts[-1]
+        assert last.index("Free on Friday?") < last.index("yes, after 3") < last.index("where then?")
+        assert "Owner: yes, after 3" in last
+
+    @pytest.mark.asyncio
+    async def test_media_without_text_is_logged_not_drafted(self, db):
+        mgr, sender, prompts = _capturing_manager(db)
+        await mgr.handle_connection_update(_fake_business_connection())
+        photo = _fake_business_message(text=None, msg_id=3)
+        photo.photo = [SimpleNamespace(file_id="x")]
+        await mgr.handle_business_message(photo)
+        assert prompts == []
+        await mgr.handle_business_message(_fake_business_message(text="what do you think?", msg_id=4))
+        assert "[photo]" in prompts[-1]
+
+    @pytest.mark.asyncio
+    async def test_bot_echo_logged_as_owner(self, db):
+        mgr, sender, prompts = _capturing_manager(db)
+        await mgr.handle_connection_update(_fake_business_connection())
+        echo = _owner_msg("sent via Send")
+        echo.sender_business_bot = SimpleNamespace(id=555, is_bot=True)
+        await mgr.handle_business_message(echo)
+        await mgr.handle_business_message(_fake_business_message(text="ok thanks", msg_id=5))
+        assert "Owner: sent via Send" in prompts[-1]
+
+    def test_chat_log_is_capped(self, db):
+        for i in range(25):
+            db.append_business_chat_log("conn1", "200", "Carol", f"m{i}", keep=20)
+        log = db.get_business_chat_log("conn1", "200")
+        assert [r["text"] for r in log] == [f"m{i}" for i in range(5, 25)]

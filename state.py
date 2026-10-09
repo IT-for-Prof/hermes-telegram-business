@@ -56,6 +56,20 @@ CREATE TABLE IF NOT EXISTS business_drafts (
 
 CREATE INDEX IF NOT EXISTS idx_biz_drafts_conn_customer
     ON business_drafts(connection_id, customer_chat_id, status);
+
+-- Short rolling log per chat (both sides): the only conversation context a
+-- Business bot can have, since bots cannot read chat history.
+CREATE TABLE IF NOT EXISTS business_chat_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    connection_id TEXT NOT NULL,
+    customer_chat_id TEXT NOT NULL,
+    author TEXT NOT NULL,
+    text TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_biz_log_chat
+    ON business_chat_log(connection_id, customer_chat_id, id);
 """
 
 
@@ -224,6 +238,34 @@ class BusinessStateDB:
             )
             self._conn.commit()
             return int(cur.lastrowid or 0)
+
+    def append_business_chat_log(
+        self, connection_id: str, customer_chat_id: str, author: str, text: str, *, keep: int = 20,
+    ) -> None:
+        """Append one message and trim the chat's log to the newest ``keep`` rows."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO business_chat_log (connection_id, customer_chat_id, author, text, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (str(connection_id), str(customer_chat_id), author, text, time.time()),
+            )
+            self._conn.execute(
+                "DELETE FROM business_chat_log WHERE connection_id = ? AND customer_chat_id = ? "
+                "AND id NOT IN (SELECT id FROM business_chat_log WHERE connection_id = ? "
+                "AND customer_chat_id = ? ORDER BY id DESC LIMIT ?)",
+                (str(connection_id), str(customer_chat_id), str(connection_id), str(customer_chat_id), int(keep)),
+            )
+            self._conn.commit()
+
+    def get_business_chat_log(self, connection_id: str, customer_chat_id: str) -> List[Dict[str, Any]]:
+        """The chat's logged messages, oldest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT author, text FROM business_chat_log WHERE connection_id = ? "
+                "AND customer_chat_id = ? ORDER BY id",
+                (str(connection_id), str(customer_chat_id)),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def supersede_pending_telegram_business_drafts(
         self, connection_id: str, customer_chat_id: str,
