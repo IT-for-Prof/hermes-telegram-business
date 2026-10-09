@@ -27,7 +27,8 @@ Discard → dropped, the customer sees nothing
 - **Owner-only buttons.** Callbacks are authorized against the connection's `owner_user_id`; anyone else gets `⛔`.
 - **Drafts expire after 24h** (configurable). Stale buttons no-op.
 - **Without `can_reply`, the Send button is hidden** — you're told to copy/paste manually instead of getting a button that silently fails.
-- **Typing bursts coalesce** — new messages within the debounce window supersede the prior draft, one draft per coherent thought.
+- **Typing bursts coalesce** — messages within the debounce window accumulate into one draft (an edit replaces its part), one draft per coherent thought.
+- **Only the other party is drafted.** Telegram delivers both sides of a Business chat: the owner's own messages and the bot's Send/Edit echoes are logged as context but never drafted. When the owner answers by hand, the chat's queued/pending draft is withdrawn so a stale Send can't double-reply. Bot senders are ignored.
 
 ## Requirements
 
@@ -66,24 +67,25 @@ Optional block in `~/.hermes/config.yaml`:
 plugins:
   entries:
     telegram-business:
-      debounce_seconds: 8        # coalesce typing bursts
-      draft_ttl_hours: 24        # stale-draft expiry
-      max_customer_text_chars: 4000
-      owner_persona: >
-        You are drafting replies for a freelance photographer.
-        Friendly, brief, always suggest a concrete next step.
+      settings:
+        debounce_seconds: 8        # coalesce typing bursts
+        draft_ttl_hours: 24        # stale-draft expiry
+        max_customer_text_chars: 4000
+        owner_persona: >
+          You are drafting replies for a freelance photographer.
+          Friendly, brief, always suggest a concrete next step.
 ```
 
 Drafting uses your active Hermes model through the host-owned plugin LLM surface (`ctx.llm`) — no separate API key.
 
 ## State
 
-Plugin-owned SQLite at `~/.hermes/telegram-business/state.db` (two tables: connections + drafts). Hermes' core state is never touched. Delete the file to reset.
+Plugin-owned SQLite at `~/.hermes/telegram-business/state.db` (three tables: connections, drafts, and `business_chat_log` — the 20 newest messages of each chat, both sides, used as draft context; purged on `/biz off <chat_id>` and when the connection ends). Hermes' core state is never touched. Delete the file to reset.
 
 ## v1 limits
 
-- **Text only** — customer media (photos, voice, documents) is skipped; captions do trigger drafts.
-- **No conversation history** — each customer message is drafted in isolation. The Edit button absorbs the gap.
+- **No vision** — media enters the context as `[photo]`, `[voice message]`, ... placeholders; captions are drafted like text.
+- **History starts at connection time** — bots can't read older messages; the draft sees the last 20 messages logged since.
 - **No persona learning from edits** — your overrides go to the customer but don't train future drafts.
 
 ## Tests
@@ -92,7 +94,7 @@ Plugin-owned SQLite at `~/.hermes/telegram-business/state.db` (two tables: conne
 python3 -m pytest
 ```
 
-37 tests covering connection lifecycle, draft supersession, debounce coalescing, all three button paths, edit capture, owner-scoped callback authorization, and `/biz` subcommands. No network, no live Telegram.
+63 tests covering connection lifecycle, owner/bot message handling, the chat log, edits, config, draft supersession, debounce coalescing, all three button paths, edit capture, owner-scoped callback authorization, and `/biz` subcommands. No network, no live Telegram.
 
 ## Credits
 

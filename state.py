@@ -65,7 +65,9 @@ CREATE TABLE IF NOT EXISTS business_chat_log (
     customer_chat_id TEXT NOT NULL,
     author TEXT NOT NULL,
     text TEXT NOT NULL,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    message_id TEXT,
+    is_owner INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_biz_log_chat
@@ -84,6 +86,14 @@ class BusinessStateDB:
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            # business_chat_log predates message_id/is_owner on some installs.
+            cols = {r[1] for r in self._conn.execute("PRAGMA table_info(business_chat_log)")}
+            if "message_id" not in cols:
+                self._conn.execute("ALTER TABLE business_chat_log ADD COLUMN message_id TEXT")
+            if "is_owner" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE business_chat_log ADD COLUMN is_owner INTEGER NOT NULL DEFAULT 0")
+                self._conn.execute("UPDATE business_chat_log SET is_owner = 1 WHERE author = 'Owner'")
             self._conn.commit()
 
     def close(self) -> None:
@@ -239,33 +249,52 @@ class BusinessStateDB:
             self._conn.commit()
             return int(cur.lastrowid or 0)
 
-    def append_business_chat_log(
-        self, connection_id: str, customer_chat_id: str, author: str, text: str, *, keep: int = 20,
+    def log_business_message(
+        self, connection_id: str, customer_chat_id: str, author: str, text: str, *,
+        message_id: Optional[str] = None, is_owner: bool = False, keep: int = 20,
     ) -> None:
-        """Append one message and trim the chat's log to the newest ``keep`` rows."""
+        """Record one message of a chat (an edit replaces its row) and keep the newest ``keep``."""
+        conn_id, chat_id = str(connection_id), str(customer_chat_id)
         with self._lock:
-            self._conn.execute(
-                "INSERT INTO business_chat_log (connection_id, customer_chat_id, author, text, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (str(connection_id), str(customer_chat_id), author, text, time.time()),
-            )
-            self._conn.execute(
-                "DELETE FROM business_chat_log WHERE connection_id = ? AND customer_chat_id = ? "
-                "AND id NOT IN (SELECT id FROM business_chat_log WHERE connection_id = ? "
-                "AND customer_chat_id = ? ORDER BY id DESC LIMIT ?)",
-                (str(connection_id), str(customer_chat_id), str(connection_id), str(customer_chat_id), int(keep)),
-            )
+            updated = message_id is not None and self._conn.execute(
+                "UPDATE business_chat_log SET text = ? WHERE connection_id = ? "
+                "AND customer_chat_id = ? AND message_id = ?",
+                (text, conn_id, chat_id, str(message_id)),
+            ).rowcount
+            if not updated:
+                self._conn.execute(
+                    "INSERT INTO business_chat_log (connection_id, customer_chat_id, author, text, "
+                    "created_at, message_id, is_owner) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (conn_id, chat_id, author, text, time.time(),
+                     None if message_id is None else str(message_id), int(is_owner)),
+                )
+                self._conn.execute(
+                    "DELETE FROM business_chat_log WHERE connection_id = ? AND customer_chat_id = ? "
+                    "AND id NOT IN (SELECT id FROM business_chat_log WHERE connection_id = ? "
+                    "AND customer_chat_id = ? ORDER BY id DESC LIMIT ?)",
+                    (conn_id, chat_id, conn_id, chat_id, int(keep)),
+                )
             self._conn.commit()
 
     def get_business_chat_log(self, connection_id: str, customer_chat_id: str) -> List[Dict[str, Any]]:
         """The chat's logged messages, oldest first."""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT author, text FROM business_chat_log WHERE connection_id = ? "
+                "SELECT author, text, is_owner FROM business_chat_log WHERE connection_id = ? "
                 "AND customer_chat_id = ? ORDER BY id",
                 (str(connection_id), str(customer_chat_id)),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def purge_business_chat_log(self, connection_id: str, customer_chat_id: Optional[str] = None) -> int:
+        """Forget a chat's log (or every chat of a connection)."""
+        sql, args = "DELETE FROM business_chat_log WHERE connection_id = ?", [str(connection_id)]
+        if customer_chat_id is not None:
+            sql, args = sql + " AND customer_chat_id = ?", args + [str(customer_chat_id)]
+        with self._lock:
+            n = self._conn.execute(sql, args).rowcount
+            self._conn.commit()
+            return n
 
     def supersede_pending_telegram_business_drafts(
         self, connection_id: str, customer_chat_id: str,

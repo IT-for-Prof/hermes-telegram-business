@@ -120,7 +120,9 @@ class BusinessModeManager:
         debounce_seconds: float = 8.0,
         draft_ttl_hours: float = 24.0,
         max_customer_text_chars: int = 4000,
+        persona_source: str = "",
     ) -> None:
+        self._persona_source = persona_source  # shown in /biz status
         self._db = session_db
         self._send = send_message
         self._draft_generator = draft_generator
@@ -195,6 +197,7 @@ class BusinessModeManager:
 
         # Connection ended → DM the owner a confirmation.
         if previous is not None and previous.get("is_enabled") and not is_enabled:
+            self._db.purge_business_chat_log(str(conn_id))  # no drafting -> no reason to keep chats
             try:
                 await self._send(
                     chat_id=int(owner_chat_id),
@@ -225,12 +228,14 @@ class BusinessModeManager:
     # business_message updates (customer talks to owner).
     # ------------------------------------------------------------------
 
-    async def handle_business_message(self, message: Any) -> None:
-        """Schedule a debounced draft for an incoming customer message.
+    async def handle_business_message(self, message: Any, *, edited: bool = False) -> None:
+        """Log a Business message and, for the other party's text, schedule a debounced draft.
 
-        ``message`` is a PTB ``Message`` from a business_message update.
-        It has ``business_connection_id``, ``chat`` (the customer chat),
-        ``from_user`` (the customer), and ``text``/``caption``.
+        Telegram delivers both sides of a Business chat (upstream issue #3): the
+        contact's messages, the owner's own, and our own sends echoed back with
+        ``sender_business_bot``. Every message goes into a short per-chat log (the
+        draft's only context, since bots cannot read history); only the contact's
+        text is drafted. ``edited`` marks an ``edited_business_message`` update.
         """
         conn_id = getattr(message, "business_connection_id", None)
         if not conn_id:
@@ -242,61 +247,53 @@ class BusinessModeManager:
             return
         if not conn.get("is_enabled"):
             return
-        if not conn.get("auto_draft", True):
-            logger.debug("Business connection %s has auto_draft=False; skipping draft", conn_id)
-            return
 
         chat = getattr(message, "chat", None)
         customer_chat_id = getattr(chat, "id", None)
         if customer_chat_id is None:
             return
-        if str(customer_chat_id) in (conn.get("paused_chats") or []):
-            logger.debug("Customer chat %s paused; skipping draft", customer_chat_id)
-            return
-
-        # Telegram delivers both sides of a Business chat (upstream issue #3). Every
-        # message goes into a short per-chat log (the draft's only context — bots can't
-        # read history); only the other party's text gets a draft.
-        key = f"{conn_id}:{customer_chat_id}"
-        by_bot = getattr(message, "sender_business_bot", None) is not None
         sender = getattr(message, "from_user", None)
         if getattr(sender, "is_bot", False):
             return  # chats with bots — incl. this bot's own DMs to the owner — are not conversations
+        by_bot = getattr(message, "sender_business_bot", None) is not None
         by_owner = by_bot or (sender is not None and str(getattr(sender, "id", "")) == str(conn.get("owner_user_id")))
         # Captions on media count too — they're often the only part the customer typed.
         text = (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
-        if len(text) > self._max_customer_text_chars:
-            text = text[: self._max_customer_text_chars]
-        self._db.append_business_chat_log(
-            str(conn_id), str(customer_chat_id),
-            "Owner" if by_owner else _customer_display_name(message),
-            text or _media_placeholder(message),
-        )
-        if by_bot:
-            return  # our own Send/Edit delivery echoing back
-        if by_owner:
-            # The owner answered by hand: drop the queued/pending draft so a stale
-            # Send button can't double-reply.
-            task = self._debounce_tasks.pop(key, None)
-            if task is not None and not task.done():
-                task.cancel()
-            self._debounce_buffers.pop(key, None)
-            self._db.supersede_pending_telegram_business_drafts(str(conn_id), str(customer_chat_id))
-            return
-        if not text:
-            return  # pure media: logged as context, no vision pipeline to draft from
+        text = text[: self._max_customer_text_chars]
+        entry = text or _media_placeholder(message)
+        if entry is None:
+            return  # service message (pin, title change, ...) — not part of the conversation
 
-        # Restart the debounce timer; the burst accumulates so no part is lost.
+        key = f"{conn_id}:{customer_chat_id}"
+        muted = str(customer_chat_id) in (conn.get("paused_chats") or [])
+        msg_id = str(getattr(message, "message_id", "") or "") or None
+        if by_owner and not by_bot and not edited:
+            # The owner answered by hand (even while drafting is paused): drop the
+            # queued/pending draft so a stale Send button can't double-reply.
+            self._drop_queued_draft(key, str(conn_id), str(customer_chat_id))
+        if not muted:  # /biz off chats are neither drafted nor logged
+            self._db.log_business_message(
+                str(conn_id), str(customer_chat_id),
+                "Owner" if by_owner else _customer_display_name(message), entry,
+                message_id=msg_id, is_owner=by_owner,
+            )
+        if by_owner or not text or muted or not conn.get("auto_draft", True):
+            return
+
+        # Restart the debounce timer; the burst accumulates (an edit replaces its part).
         prior = self._debounce_tasks.pop(key, None)
         if prior is not None and not prior.done():
             prior.cancel()
-        parts = self._debounce_buffers.get(key, {}).get("parts", []) + [text]
+        parts = list(self._debounce_buffers.get(key, {}).get("parts", []))
+        if edited and any(pid == msg_id for pid, _ in parts):
+            parts = [(pid, text if pid == msg_id else ptext) for pid, ptext in parts]
+        else:
+            parts.append((msg_id, text))
         self._debounce_buffers[key] = {
             "conn_id": str(conn_id),
             "owner_chat_id": str(conn.get("owner_chat_id")),
             "customer_chat_id": str(customer_chat_id),
-            "customer_msg_id": str(getattr(message, "message_id", "") or ""),
-            "customer_text": "\n".join(parts)[-self._max_customer_text_chars:],
+            "customer_msg_id": msg_id or "",
             "customer_name": _customer_display_name(message),
             "parts": parts,
         }
@@ -310,6 +307,18 @@ class BusinessModeManager:
                 self._debounce_then_draft(key)
             )
 
+    def _drop_queued_draft(self, key: str, conn_id: str, customer_chat_id: str) -> None:
+        """Cancel the chat's queued draft, supersede its pending one, end any Edit capture of it."""
+        task = self._debounce_tasks.pop(key, None)
+        if task is not None and not task.done():
+            task.cancel()
+        self._debounce_buffers.pop(key, None)
+        self._db.supersede_pending_telegram_business_drafts(conn_id, customer_chat_id)
+        for owner_chat, draft_id in list(self._edit_capture.items()):
+            draft = self._db.get_telegram_business_draft(draft_id)
+            if draft and draft["connection_id"] == conn_id and draft["customer_chat_id"] == customer_chat_id:
+                self._edit_capture.pop(owner_chat, None)
+
     async def _debounce_then_draft(self, key: str) -> None:
         try:
             await asyncio.sleep(self._debounce_seconds)
@@ -318,12 +327,29 @@ class BusinessModeManager:
         try:
             await self._run_draft(key)
         finally:
-            self._debounce_tasks.pop(key, None)
+            # A newer message may have replaced this task; never untrack the successor.
+            if self._debounce_tasks.get(key) is asyncio.current_task():
+                self._debounce_tasks.pop(key, None)
 
     async def _run_draft(self, key: str) -> None:
-        buf = self._debounce_buffers.pop(key, None)
+        buf = self._debounce_buffers.get(key)
         if not buf:
             return
+        try:
+            await self._draft_from_buffer(key, buf)
+        except asyncio.CancelledError:
+            raise  # a newer message took over: its run keeps this burst's parts
+        except BaseException:
+            self._release_buffer(key, buf)
+            raise
+        self._release_buffer(key, buf)
+
+    def _release_buffer(self, key: str, buf: Dict[str, Any]) -> None:
+        if self._debounce_buffers.get(key) is buf:
+            self._debounce_buffers.pop(key, None)
+
+    async def _draft_from_buffer(self, key: str, buf: Dict[str, Any]) -> None:
+        buf["customer_text"] = "\n".join(ptext for _, ptext in buf["parts"])[-self._max_customer_text_chars:]
 
         # Re-check the connection state — owner may have hit /biz pause
         # during the debounce window.
@@ -629,7 +655,8 @@ class BusinessModeManager:
         active = [c for c in connections if c.get("is_enabled")]
 
         if not args:
-            return self._render_status(connections=connections, owner_chat_id=owner_chat_id)
+            return self._render_status(connections=connections, owner_chat_id=owner_chat_id,
+                                       persona_source=self._persona_source)
 
         sub = args[0].lower()
         if sub in {"pause", "resume"}:
@@ -655,6 +682,7 @@ class BusinessModeManager:
                     self._db.set_telegram_business_paused_chats(
                         conn["connection_id"], paused,
                     )
+                    self._db.purge_business_chat_log(conn["connection_id"], chat_arg)
                     updated += 1
                 elif sub == "on" and chat_arg in paused:
                     paused.remove(chat_arg)
@@ -709,7 +737,8 @@ class BusinessModeManager:
         )
 
     @staticmethod
-    def _render_status(*, connections: List[Dict[str, Any]], owner_chat_id: str) -> str:
+    def _render_status(*, connections: List[Dict[str, Any]], owner_chat_id: str,
+                       persona_source: str = "") -> str:
         if not connections:
             return (
                 "You haven't connected this bot to any Telegram Business account yet.\n\n"
@@ -726,6 +755,8 @@ class BusinessModeManager:
             lines.append(
                 f"• {state}  ·  {auto}  ·  {send_perm}{paused_note}"
             )
+        if persona_source:
+            lines.append(f"Draft persona: {persona_source}")
         lines.append("")
         lines.append(
             "Commands: /biz pause · /biz resume · /biz off <chat_id> · /biz on <chat_id>"
@@ -767,17 +798,29 @@ _MEDIA_LABELS = (
 )
 
 
-def _media_placeholder(message: Any) -> str:
-    return next((label for attr, label in _MEDIA_LABELS if getattr(message, attr, None)), "[media]")
+def _media_placeholder(message: Any) -> Optional[str]:
+    """``[photo]`` etc. for media; None for service messages (pins, title changes)."""
+    return next((label for attr, label in _MEDIA_LABELS if getattr(message, attr, None)), None)
 
 
 def _render_conversation(log: List[Dict[str, Any]], customer_name: str) -> str:
-    """The draft prompt: the recent conversation, oldest first."""
-    lines = "\n".join(f"{r['author']}: {r['text']}" for r in log)
+    """The draft prompt: the recent conversation, oldest first.
+
+    Speaker tags come from ``is_owner``, never from text: continuation lines are
+    indented and names flattened, so a contact can't forge an ``[Owner]`` turn.
+    """
+    def one_line(s: str) -> str:
+        return " ".join(str(s).split())
+
+    def turn(r: Dict[str, Any]) -> str:
+        who = "[Owner]" if r.get("is_owner") else f"[Contact: {one_line(r['author'])}]"
+        return f"{who} " + str(r["text"]).replace("\n", "\n    ")
+
+    lines = "\n".join(turn(r) for r in log)
     return (
-        'Conversation so far, oldest first. "Owner" is the account owner you are drafting for.\n\n'
+        "Conversation so far, oldest first. [Owner] is the account owner you are drafting for.\n\n"
         f"{lines}\n\n"
-        f"Draft the owner's reply to the latest message(s) from {customer_name}."
+        f"Draft the owner's reply to the latest message(s) from {one_line(customer_name)}."
     )
 
 

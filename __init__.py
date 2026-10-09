@@ -65,41 +65,49 @@ def _hermes_home() -> Path:
     return Path.home() / ".hermes"
 
 
-def _plugin_config(ctx: Any) -> dict:
-    """Read this plugin's config block from config.yaml (best-effort).
+_CONFIG_KEYS = ("debounce_seconds", "draft_ttl_hours", "max_customer_text_chars", "owner_persona")
 
-    Users configure under ``plugins.entries.telegram-business.*``:
+
+def _plugin_config(ctx: Any) -> dict:
+    """This plugin's settings, per key (best-effort).
+
+    Preferred layout (read through the host API ``ctx.get_config``)::
 
         plugins:
           entries:
             telegram-business:
-              debounce_seconds: 8
-              draft_ttl_hours: 24
-              max_customer_text_chars: 4000
-              owner_persona: "..."
+              settings:
+                debounce_seconds: 8
+                draft_ttl_hours: 24
+                max_customer_text_chars: 4000
+                owner_persona: "..."
+
+    The legacy flat layout (keys directly under ``telegram-business``) still
+    works; ``settings`` wins per key. Never parse config.yaml ourselves: PyYAML is
+    not importable inside the gateway, and a silent failure here used to swap in
+    the built-in English persona.
     """
-    # Host API first: plugins.entries.<id>.settings.<key> (or the legacy .config subtree).
+    cfg: dict = {}
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        entry = (((load_config_readonly() or {}).get("plugins") or {}).get("entries") or {}).get(
+            "telegram-business") or {}
+        if isinstance(entry, dict):
+            cfg = {k: entry[k] for k in _CONFIG_KEYS if entry.get(k) is not None}
+    except Exception as exc:
+        logger.warning("telegram-business: legacy config read failed: %s", exc)
     getter = getattr(ctx, "get_config", None)
     if callable(getter):
-        try:
-            keys = ("debounce_seconds", "draft_ttl_hours", "max_customer_text_chars", "owner_persona")
-            found = {k: v for k in keys if (v := getter(k)) is not None}
-            if found:
-                return found
-        except Exception as exc:
-            logger.warning("telegram-business: ctx.get_config failed: %s", exc)
-    try:
-        import yaml
-        cfg_path = _hermes_home() / "config.yaml"
-        if cfg_path.exists():
-            raw = yaml.safe_load(cfg_path.read_text()) or {}
-            entries = ((raw.get("plugins") or {}).get("entries") or {})
-            block = entries.get("telegram-business") or {}
-            if isinstance(block, dict):
-                return block
-    except Exception as exc:  # pragma: no cover - defensive
-        logger.warning("telegram-business: config read failed: %s", exc)
-    return {}
+        for key in _CONFIG_KEYS:
+            try:
+                value = getter(key)
+            except Exception as exc:
+                logger.warning("telegram-business: ctx.get_config(%r) failed: %s", key, exc)
+                continue
+            if value is not None:
+                cfg[key] = value
+    return cfg
 
 
 def register(ctx: Any) -> None:
@@ -108,8 +116,8 @@ def register(ctx: Any) -> None:
     ttl_hours = float(cfg.get("draft_ttl_hours", 24.0))
     max_chars = int(cfg.get("max_customer_text_chars", 4000))
     persona = str(cfg.get("owner_persona") or _DEFAULT_PERSONA)
-    logger.info("telegram-business: persona from %s (%d chars)",
-                "config" if cfg.get("owner_persona") else "BUILT-IN DEFAULT", len(persona))
+    persona_source = f"{'config' if cfg.get('owner_persona') else 'BUILT-IN DEFAULT'}, {len(persona)} chars"
+    logger.info("telegram-business: persona from %s", persona_source)
 
     # Deferred singletons — constructed on first connect so import stays light.
     _state: dict = {"db": None, "manager": None}
@@ -136,10 +144,10 @@ def register(ctx: Any) -> None:
             "customer asked something that genuinely needs a longer reply."
         )
 
-        async def _draft(customer_text: str, customer_chat_id: str) -> str:
+        async def _draft(prompt_text: str, customer_chat_id: str) -> str:
             messages = [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": customer_text},
+                {"role": "user", "content": prompt_text},
             ]
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(
@@ -160,6 +168,7 @@ def register(ctx: Any) -> None:
             debounce_seconds=debounce,
             draft_ttl_hours=ttl_hours,
             max_customer_text_chars=max_chars,
+            persona_source=persona_source,
         )
         return _state["manager"]
 
@@ -189,14 +198,14 @@ def register(ctx: Any) -> None:
                 logger.exception("telegram-business: connection handler failed: %s", exc)
 
         async def _on_business_message(update, context):
-            message = (
-                getattr(update, "business_message", None)
-                or getattr(update, "edited_business_message", None)
-            )
+            message = getattr(update, "business_message", None)
+            edited = message is None
+            if edited:
+                message = getattr(update, "edited_business_message", None)
             if message is None:
                 return
             try:
-                await manager.handle_business_message(message)
+                await manager.handle_business_message(message, edited=edited)
             except Exception as exc:
                 logger.exception("telegram-business: message handler failed: %s", exc)
 
