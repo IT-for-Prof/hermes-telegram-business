@@ -698,3 +698,62 @@ class TestBizCommand:
             owner_user_id="42", owner_chat_id="100", args=["unknown"],
         )
         assert "Usage" in reply
+
+
+class TestOwnerAndBotMessages:
+    """Telegram delivers both sides of a Business chat (issue #3)."""
+
+    @staticmethod
+    def _owner_message(*, customer_chat_id=200, text="I'll answer myself", msg_id=77):
+        msg = _fake_business_message(customer_chat_id=customer_chat_id, customer_id=42,
+                                     text=text, msg_id=msg_id)
+        msg.from_user.full_name = "Owner"
+        return msg
+
+    @pytest.mark.asyncio
+    async def test_owner_message_is_not_drafted(self, db):
+        mgr, sender = _make_manager(db)
+        await mgr.handle_connection_update(_fake_business_connection())
+        sender.calls.clear()
+        await mgr.handle_business_message(self._owner_message())
+        assert sender.calls == []
+        assert db.get_pending_telegram_business_drafts_for_owner("100") == []
+
+    @pytest.mark.asyncio
+    async def test_bot_sent_echo_is_not_drafted(self, db):
+        mgr, sender = _make_manager(db)
+        await mgr.handle_connection_update(_fake_business_connection())
+        sender.calls.clear()
+        echo = self._owner_message(text="sent via the Send button")
+        echo.sender_business_bot = SimpleNamespace(id=555, is_bot=True)
+        await mgr.handle_business_message(echo)
+        assert sender.calls == []
+        assert db.get_pending_telegram_business_drafts_for_owner("100") == []
+
+    @pytest.mark.asyncio
+    async def test_owner_manual_reply_supersedes_pending_draft(self, db):
+        mgr, sender = _make_manager(db)
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message(text="Free on Friday?"))
+        assert len(db.get_pending_telegram_business_drafts_for_owner("100")) == 1
+        await mgr.handle_business_message(self._owner_message(text="yes, 3pm"))
+        assert db.get_pending_telegram_business_drafts_for_owner("100") == []
+
+    @pytest.mark.asyncio
+    async def test_owner_reply_during_debounce_cancels_draft(self, db):
+        mgr, sender = _make_manager(db, debounce=0.05)
+        await mgr.handle_connection_update(_fake_business_connection())
+        sender.calls.clear()
+        await mgr.handle_business_message(_fake_business_message(text="Free on Friday?"))
+        await mgr.handle_business_message(self._owner_message(text="yes, 3pm"))
+        await asyncio.sleep(0.2)
+        assert [c for c in sender.calls if c.get("chat_id") == 100] == []
+        assert db.get_pending_telegram_business_drafts_for_owner("100") == []
+
+    @pytest.mark.asyncio
+    async def test_owner_reply_in_other_chat_keeps_draft(self, db):
+        mgr, sender = _make_manager(db)
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message(customer_chat_id=200, text="ping"))
+        await mgr.handle_business_message(self._owner_message(customer_chat_id=300))
+        assert len(db.get_pending_telegram_business_drafts_for_owner("100")) == 1

@@ -206,11 +206,7 @@ class BusinessStateDB:
         """
         now = time.time()
         with self._lock:
-            self._conn.execute(
-                "UPDATE business_drafts SET status = 'superseded', updated_at = ? "
-                "WHERE connection_id = ? AND customer_chat_id = ? AND status = 'pending'",
-                (now, str(connection_id), str(customer_chat_id)),
-            )
+            self._supersede_pending(now, connection_id, customer_chat_id)
             cur = self._conn.execute(
                 """
                 INSERT INTO business_drafts (
@@ -228,6 +224,23 @@ class BusinessStateDB:
             )
             self._conn.commit()
             return int(cur.lastrowid or 0)
+
+    def supersede_pending_telegram_business_drafts(
+        self, connection_id: str, customer_chat_id: str,
+    ) -> int:
+        """Retire the live draft of one conversation (the owner answered by hand)."""
+        with self._lock:
+            n = self._supersede_pending(time.time(), connection_id, customer_chat_id)
+            self._conn.commit()
+            return n
+
+    def _supersede_pending(self, now: float, connection_id: str, customer_chat_id: str) -> int:
+        """Caller holds ``self._lock`` and commits."""
+        return self._conn.execute(
+            "UPDATE business_drafts SET status = 'superseded', updated_at = ? "
+            "WHERE connection_id = ? AND customer_chat_id = ? AND status = 'pending'",
+            (now, str(connection_id), str(customer_chat_id)),
+        ).rowcount
 
     def get_telegram_business_draft(self, draft_id: int) -> Optional[Dict[str, Any]]:
         with self._lock:

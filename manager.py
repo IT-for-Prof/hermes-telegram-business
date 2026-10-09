@@ -254,6 +254,22 @@ class BusinessModeManager:
             logger.debug("Customer chat %s paused; skipping draft", customer_chat_id)
             return
 
+        # Telegram delivers both sides of a Business chat (upstream issue #3): only the
+        # other party gets drafts. Ignore the bot's own sends; a message the owner typed
+        # by hand answers the conversation, so drop its queued/pending draft — a stale
+        # Send button would otherwise double-reply.
+        if getattr(message, "sender_business_bot", None) is not None:
+            return
+        sender = getattr(message, "from_user", None)
+        if sender is not None and str(getattr(sender, "id", "")) == str(conn.get("owner_user_id")):
+            key = f"{conn_id}:{customer_chat_id}"
+            task = self._debounce_tasks.pop(key, None)
+            if task is not None and not task.done():
+                task.cancel()
+            self._debounce_buffers.pop(key, None)
+            self._db.supersede_pending_telegram_business_drafts(str(conn_id), str(customer_chat_id))
+            return
+
         # Pull text. Captions on media count too — they're often the only
         # part the customer typed.
         text = (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
