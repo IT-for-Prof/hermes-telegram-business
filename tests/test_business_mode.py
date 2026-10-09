@@ -982,3 +982,10 @@ async def test_biz_status_shows_persona_source(db):
     await mgr.handle_connection_update(_fake_business_connection())
     status = await mgr.handle_biz_command(owner_user_id="42", owner_chat_id="100", args=[])
     assert "Draft persona: config, 1760 chars\n\nCommands:" in status
+
+
+def test_draft_dm_shows_mute_command():
+    from telegram_business_plugin.manager import BusinessModeManager
+    body = BusinessModeManager._render_draft_owner_message(
+        customer_name="Ann", customer_chat_id="777", customer_text="hi", draft_text="hello")
+    assert body.endswith("Mute this chat: /biz off 777")

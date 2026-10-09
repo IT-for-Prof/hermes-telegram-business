@@ -6,7 +6,7 @@ Connect your Telegram Business account to your Hermes bot and it becomes your se
 
 ```
 Customer → your Business account (via Business Mode)
-            ↓ debounce 8s, draft once
+            ↓ debounce (default 8s), draft once
 Bot → your DM
        💬 Carol wrote:
          > Hey, are you free Friday afternoon?
@@ -28,7 +28,7 @@ Discard → dropped, the customer sees nothing
 - **Drafts expire after 24h** (configurable). Stale buttons no-op.
 - **Without `can_reply`, the Send button is hidden** — you're told to copy/paste manually instead of getting a button that silently fails.
 - **Typing bursts coalesce** — messages within the debounce window accumulate into one draft (an edit replaces its part), one draft per coherent thought.
-- **Only the other party is drafted.** Telegram delivers both sides of a Business chat: the owner's own messages and the bot's Send/Edit echoes are logged as context but never drafted. When the owner answers by hand, the chat's queued/pending draft is withdrawn so a stale Send can't double-reply. Bot senders are ignored.
+- **Only the other party is drafted.** Telegram delivers both sides of a Business chat: the owner's own messages and the bot's Send/Edit echoes are logged as context but never drafted. When the owner answers by hand, the chat's queued/pending draft is withdrawn so a stale Send can't double-reply. Messages from other bots (`from_user.is_bot`, incl. this bot's own DMs to the owner) are neither logged nor drafted.
 
 ## Requirements
 
@@ -38,6 +38,8 @@ Discard → dropped, the customer sees nothing
 - python-telegram-bot ≥ 21.1 (already installed with the Hermes Telegram platform)
 
 ## Install
+
+This checkout is branch `local/owner-messages` (upstream `main` + owner/bot filtering, the chat log, edits, `settings` config). A fresh upstream clone lacks them; `hermes plugins update` would drop them.
 
 ```bash
 git clone https://github.com/NousResearch/hermes-telegram-business \
@@ -57,7 +59,7 @@ Restart the gateway (`hermes gateway restart`). Then:
 |---|---|
 | `/biz` | status dashboard |
 | `/biz pause` / `/biz resume` | global drafting kill switch |
-| `/biz off <chat_id>` / `/biz on <chat_id>` | per-customer-chat mute |
+| `/biz off <chat_id>` / `/biz on <chat_id>` | per-customer-chat mute: no drafts, no logging until `/biz on`; `off` purges the chat's log |
 
 ## Configuration
 
@@ -80,7 +82,7 @@ Drafting uses your active Hermes model through the host-owned plugin LLM surface
 
 ## State
 
-Plugin-owned SQLite at `~/.hermes/telegram-business/state.db` (three tables: connections, drafts, and `business_chat_log` — the 20 newest messages of each chat, both sides, used as draft context; purged on `/biz off <chat_id>` and when the connection ends). Hermes' core state is never touched. Delete the file to reset.
+Plugin-owned SQLite at `~/.hermes/telegram-business/state.db` (three tables: connections, drafts, and `business_chat_log` — the 20 newest messages of each chat, both sides, used as draft context; purged on `/biz off <chat_id>` and when the connection ends). Hermes' core state is never touched. To reset: stop the gateway, delete the file, start it (the running process keeps the open file).
 
 ## v1 limits
 
@@ -94,7 +96,7 @@ Plugin-owned SQLite at `~/.hermes/telegram-business/state.db` (three tables: con
 python3 -m pytest
 ```
 
-63 tests covering connection lifecycle, owner/bot message handling, the chat log, edits, config, draft supersession, debounce coalescing, all three button paths, edit capture, owner-scoped callback authorization, and `/biz` subcommands. No network, no live Telegram.
+65 tests covering connection lifecycle, owner/bot message handling, the chat log, edits, config, draft supersession, debounce coalescing, all three button paths, edit capture, owner-scoped callback authorization, and `/biz` subcommands. No network, no live Telegram.
 
 ## Credits
 

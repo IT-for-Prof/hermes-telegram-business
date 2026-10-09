@@ -28,9 +28,9 @@ User flow (the simplest path that works end-to-end):
 
 The owner is always in control: ``can_reply`` from Telegram is required
 for the Send button to appear, ``/biz pause`` globally suspends drafting,
-and per-chat pauses live in ``telegram_business_connections.paused_chats``.
+and per-chat pauses live in ``business_connections.paused_chats``.
 
-State lives in two SQLite tables in the plugin's own database file
+State lives in SQLite tables in the plugin's own database file
 (``<HERMES_HOME>/telegram-business/state.db``) — see ``state.py`` for the
 schema. Hermes' core state.db is never touched.
 
@@ -79,7 +79,7 @@ ONBOARDING_MESSAGE = (
     "  /biz             — show status and active connections\n"
     "  /biz pause       — pause drafting (you still see the messages)\n"
     "  /biz resume      — resume drafting\n"
-    "  /biz off         — disable drafting for one chat (reply to that customer's draft)\n\n"
+    "  /biz off <id>    — disable drafting for one chat (the id is under each draft)\n\n"
     "I never auto-send. Every reply is yours to approve."
 )
 
@@ -395,6 +395,7 @@ class BusinessModeManager:
 
         owner_message = self._render_draft_owner_message(
             customer_name=buf["customer_name"],
+            customer_chat_id=buf["customer_chat_id"],
             customer_text=customer_text,
             draft_text=draft_text,
         )
@@ -712,14 +713,15 @@ class BusinessModeManager:
 
     @staticmethod
     def _render_draft_owner_message(
-        *, customer_name: str, customer_text: str, draft_text: str
+        *, customer_name: str, customer_chat_id: str, customer_text: str, draft_text: str
     ) -> str:
         """Build the plain-text owner-DM body that carries one draft."""
         return (
             f"💬 {customer_name} wrote:\n"
             f"{_quote_block(customer_text)}\n\n"
             f"📝 Suggested reply:\n"
-            f"{draft_text}"
+            f"{draft_text}\n\n"
+            f"Mute this chat: /biz off {customer_chat_id}"
         )
 
     @staticmethod
