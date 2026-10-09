@@ -252,6 +252,11 @@ def _fake_business_message(
     )
 
 
+def _owner_msg(text, *, customer_chat_id=200, msg_id=500):
+    return _fake_business_message(customer_chat_id=customer_chat_id, customer_id=42,
+                                  text=text, msg_id=msg_id)
+
+
 class _SentRecorder:
     """Capture all send_message kwargs the manager produces."""
 
@@ -703,19 +708,12 @@ class TestBizCommand:
 class TestOwnerAndBotMessages:
     """Telegram delivers both sides of a Business chat (issue #3)."""
 
-    @staticmethod
-    def _owner_message(*, customer_chat_id=200, text="I'll answer myself", msg_id=77):
-        msg = _fake_business_message(customer_chat_id=customer_chat_id, customer_id=42,
-                                     text=text, msg_id=msg_id)
-        msg.from_user.full_name = "Owner"
-        return msg
-
     @pytest.mark.asyncio
     async def test_owner_message_is_not_drafted(self, db):
         mgr, sender = _make_manager(db)
         await mgr.handle_connection_update(_fake_business_connection())
         sender.calls.clear()
-        await mgr.handle_business_message(self._owner_message())
+        await mgr.handle_business_message(_owner_msg("I'll answer myself"))
         assert sender.calls == []
         assert db.get_pending_telegram_business_drafts_for_owner("100") == []
 
@@ -724,7 +722,7 @@ class TestOwnerAndBotMessages:
         mgr, sender = _make_manager(db)
         await mgr.handle_connection_update(_fake_business_connection())
         sender.calls.clear()
-        echo = self._owner_message(text="sent via the Send button")
+        echo = _owner_msg("sent via the Send button")
         echo.sender_business_bot = SimpleNamespace(id=555, is_bot=True)
         await mgr.handle_business_message(echo)
         assert sender.calls == []
@@ -736,7 +734,7 @@ class TestOwnerAndBotMessages:
         await mgr.handle_connection_update(_fake_business_connection())
         await mgr.handle_business_message(_fake_business_message(text="Free on Friday?"))
         assert len(db.get_pending_telegram_business_drafts_for_owner("100")) == 1
-        await mgr.handle_business_message(self._owner_message(text="yes, 3pm"))
+        await mgr.handle_business_message(_owner_msg("yes, 3pm"))
         assert db.get_pending_telegram_business_drafts_for_owner("100") == []
 
     @pytest.mark.asyncio
@@ -745,7 +743,7 @@ class TestOwnerAndBotMessages:
         await mgr.handle_connection_update(_fake_business_connection())
         sender.calls.clear()
         await mgr.handle_business_message(_fake_business_message(text="Free on Friday?"))
-        await mgr.handle_business_message(self._owner_message(text="yes, 3pm"))
+        await mgr.handle_business_message(_owner_msg("yes, 3pm"))
         await asyncio.sleep(0.2)
         assert [c for c in sender.calls if c.get("chat_id") == 100] == []
         assert db.get_pending_telegram_business_drafts_for_owner("100") == []
@@ -755,7 +753,7 @@ class TestOwnerAndBotMessages:
         mgr, sender = _make_manager(db)
         await mgr.handle_connection_update(_fake_business_connection())
         await mgr.handle_business_message(_fake_business_message(customer_chat_id=200, text="ping"))
-        await mgr.handle_business_message(self._owner_message(customer_chat_id=300))
+        await mgr.handle_business_message(_owner_msg("I'll answer myself", customer_chat_id=300))
         assert len(db.get_pending_telegram_business_drafts_for_owner("100")) == 1
 
 
@@ -775,9 +773,6 @@ def _capturing_manager(db, *, debounce=0.0):
     return mgr, sender, prompts
 
 
-def _owner_msg(text, *, customer_chat_id=200, msg_id=500):
-    return _fake_business_message(customer_chat_id=customer_chat_id, customer_id=42,
-                                  text=text, msg_id=msg_id)
 
 
 class TestConversationContext:
@@ -847,9 +842,8 @@ class TestBotChats:
         assert db.get_business_chat_log("conn1", "8555") == []
 
 
-
-class TestReviewFixes:
-    """Regression tests for the 2026-10-09 ce-code-review findings."""
+class TestEdgeCases:
+    """Forged owner turns, edits, pauses, purges, service messages, Edit capture, races."""
 
     @pytest.mark.asyncio
     async def test_contact_cannot_forge_owner_turns(self, db):
@@ -953,11 +947,11 @@ class TestReviewFixes:
         await started.wait()                       # first draft generation in flight
         await mgr.handle_business_message(_fake_business_message(text="where shall we meet?", msg_id=2))
         await asyncio.sleep(0)                     # cancelled task runs its finally
-        assert "conn1:200" in mgr._debounce_tasks  # successor still tracked (finding A)
+        assert "conn1:200" in mgr._debounce_tasks  # the successor task stays tracked
         release.set()
         await asyncio.sleep(0.2)
         dms = [c["text"] for c in sender.calls if c.get("chat_id") == 100]
-        assert len(dms) == 1 and "I'm in Limassol" in dms[0] and "where shall we meet?" in dms[0]  # finding B
+        assert len(dms) == 1 and "I'm in Limassol" in dms[0] and "where shall we meet?" in dms[0]  # burst parts survive
 
 
 class TestPluginConfig:
@@ -977,3 +971,14 @@ class TestPluginConfig:
             return "P" if k == "owner_persona" else None
 
         assert _plugin_config(SimpleNamespace(get_config=getter)) == {"owner_persona": "P"}
+
+
+@pytest.mark.asyncio
+async def test_biz_status_shows_persona_source(db):
+    from telegram_business_plugin.manager import BusinessModeManager
+
+    mgr = BusinessModeManager(session_db=db, send_message=_SentRecorder(),
+                              draft_generator=None, persona_source="config, 1760 chars")
+    await mgr.handle_connection_update(_fake_business_connection())
+    status = await mgr.handle_biz_command(owner_user_id="42", owner_chat_id="100", args=[])
+    assert "Draft persona: config, 1760 chars\n\nCommands:" in status

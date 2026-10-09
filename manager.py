@@ -256,7 +256,8 @@ class BusinessModeManager:
         if getattr(sender, "is_bot", False):
             return  # chats with bots — incl. this bot's own DMs to the owner — are not conversations
         by_bot = getattr(message, "sender_business_bot", None) is not None
-        by_owner = by_bot or (sender is not None and str(getattr(sender, "id", "")) == str(conn.get("owner_user_id")))
+        sent_by_owner = sender is not None and str(getattr(sender, "id", "")) == str(conn.get("owner_user_id"))
+        by_owner = by_bot or sent_by_owner
         # Captions on media count too — they're often the only part the customer typed.
         text = (getattr(message, "text", None) or getattr(message, "caption", None) or "").strip()
         text = text[: self._max_customer_text_chars]
@@ -281,9 +282,7 @@ class BusinessModeManager:
             return
 
         # Restart the debounce timer; the burst accumulates (an edit replaces its part).
-        prior = self._debounce_tasks.pop(key, None)
-        if prior is not None and not prior.done():
-            prior.cancel()
+        self._cancel_debounce(key)
         parts = list(self._debounce_buffers.get(key, {}).get("parts", []))
         if edited and any(pid == msg_id for pid, _ in parts):
             parts = [(pid, text if pid == msg_id else ptext) for pid, ptext in parts]
@@ -309,15 +308,18 @@ class BusinessModeManager:
 
     def _drop_queued_draft(self, key: str, conn_id: str, customer_chat_id: str) -> None:
         """Cancel the chat's queued draft, supersede its pending one, end any Edit capture of it."""
-        task = self._debounce_tasks.pop(key, None)
-        if task is not None and not task.done():
-            task.cancel()
+        self._cancel_debounce(key)
         self._debounce_buffers.pop(key, None)
         self._db.supersede_pending_telegram_business_drafts(conn_id, customer_chat_id)
         for owner_chat, draft_id in list(self._edit_capture.items()):
             draft = self._db.get_telegram_business_draft(draft_id)
             if draft and draft["connection_id"] == conn_id and draft["customer_chat_id"] == customer_chat_id:
                 self._edit_capture.pop(owner_chat, None)
+
+    def _cancel_debounce(self, key: str) -> None:
+        task = self._debounce_tasks.pop(key, None)
+        if task is not None and not task.done():
+            task.cancel()
 
     async def _debounce_then_draft(self, key: str) -> None:
         try:
@@ -335,21 +337,18 @@ class BusinessModeManager:
         buf = self._debounce_buffers.get(key)
         if not buf:
             return
+        cancelled = False
         try:
             await self._draft_from_buffer(key, buf)
         except asyncio.CancelledError:
-            raise  # a newer message took over: its run keeps this burst's parts
-        except BaseException:
-            self._release_buffer(key, buf)
+            cancelled = True  # a newer message took over: its run keeps this burst's parts
             raise
-        self._release_buffer(key, buf)
-
-    def _release_buffer(self, key: str, buf: Dict[str, Any]) -> None:
-        if self._debounce_buffers.get(key) is buf:
-            self._debounce_buffers.pop(key, None)
+        finally:
+            if not cancelled and self._debounce_buffers.get(key) is buf:
+                self._debounce_buffers.pop(key, None)
 
     async def _draft_from_buffer(self, key: str, buf: Dict[str, Any]) -> None:
-        buf["customer_text"] = "\n".join(ptext for _, ptext in buf["parts"])[-self._max_customer_text_chars:]
+        customer_text = "\n".join(ptext for _, ptext in buf["parts"])[-self._max_customer_text_chars:]
 
         # Re-check the connection state — owner may have hit /biz pause
         # during the debounce window.
@@ -360,7 +359,7 @@ class BusinessModeManager:
             return
 
         log = self._db.get_business_chat_log(buf["conn_id"], buf["customer_chat_id"])
-        prompt = _render_conversation(log, buf["customer_name"]) if log else buf["customer_text"]
+        prompt = _render_conversation(log, buf["customer_name"]) if log else customer_text
         try:
             draft_text = await self._draft_generator(prompt, buf["customer_chat_id"])
         except Exception as exc:
@@ -371,7 +370,7 @@ class BusinessModeManager:
                     text=(
                         "⚠️ I couldn't draft a reply to "
                         f"{buf['customer_name']}: {exc}.\n\n"
-                        f"Their message was:\n\n{buf['customer_text']}"
+                        f"Their message was:\n\n{customer_text}"
                     ),
                     disable_notification=True,
                 )
@@ -389,14 +388,14 @@ class BusinessModeManager:
             owner_chat_id=buf["owner_chat_id"],
             customer_chat_id=buf["customer_chat_id"],
             customer_msg_id=buf["customer_msg_id"] or None,
-            customer_text=buf["customer_text"],
+            customer_text=customer_text,
             draft_text=draft_text,
             ttl_seconds=self._draft_ttl_seconds,
         )
 
         owner_message = self._render_draft_owner_message(
             customer_name=buf["customer_name"],
-            customer_text=buf["customer_text"],
+            customer_text=customer_text,
             draft_text=draft_text,
         )
         keyboard = self._build_draft_keyboard(draft_id, can_reply=bool(conn.get("can_reply")))
@@ -655,8 +654,11 @@ class BusinessModeManager:
         active = [c for c in connections if c.get("is_enabled")]
 
         if not args:
-            return self._render_status(connections=connections, owner_chat_id=owner_chat_id,
-                                       persona_source=self._persona_source)
+            status = self._render_status(connections=connections, owner_chat_id=owner_chat_id)
+            if self._persona_source and connections:  # shown above the Commands line
+                head, sep, tail = status.rpartition("\n\nCommands:")
+                status = f"{head}\nDraft persona: {self._persona_source}{sep}{tail}"
+            return status
 
         sub = args[0].lower()
         if sub in {"pause", "resume"}:
@@ -737,8 +739,7 @@ class BusinessModeManager:
         )
 
     @staticmethod
-    def _render_status(*, connections: List[Dict[str, Any]], owner_chat_id: str,
-                       persona_source: str = "") -> str:
+    def _render_status(*, connections: List[Dict[str, Any]], owner_chat_id: str) -> str:
         if not connections:
             return (
                 "You haven't connected this bot to any Telegram Business account yet.\n\n"
@@ -755,8 +756,6 @@ class BusinessModeManager:
             lines.append(
                 f"• {state}  ·  {auto}  ·  {send_perm}{paused_note}"
             )
-        if persona_source:
-            lines.append(f"Draft persona: {persona_source}")
         lines.append("")
         lines.append(
             "Commands: /biz pause · /biz resume · /biz off <chat_id> · /biz on <chat_id>"

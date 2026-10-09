@@ -115,8 +115,9 @@ def register(ctx: Any) -> None:
     debounce = float(cfg.get("debounce_seconds", 8.0))
     ttl_hours = float(cfg.get("draft_ttl_hours", 24.0))
     max_chars = int(cfg.get("max_customer_text_chars", 4000))
-    persona = str(cfg.get("owner_persona") or _DEFAULT_PERSONA)
-    persona_source = f"{'config' if cfg.get('owner_persona') else 'BUILT-IN DEFAULT'}, {len(persona)} chars"
+    custom_persona = cfg.get("owner_persona")
+    persona = str(custom_persona or _DEFAULT_PERSONA)
+    persona_source = f"{'config' if custom_persona else 'BUILT-IN DEFAULT'}, {len(persona)} chars"
     logger.info("telegram-business: persona from %s", persona_source)
 
     # Deferred singletons — constructed on first connect so import stays light.

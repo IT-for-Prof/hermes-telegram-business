@@ -86,14 +86,6 @@ class BusinessStateDB:
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.executescript(_SCHEMA)
-            # business_chat_log predates message_id/is_owner on some installs.
-            cols = {r[1] for r in self._conn.execute("PRAGMA table_info(business_chat_log)")}
-            if "message_id" not in cols:
-                self._conn.execute("ALTER TABLE business_chat_log ADD COLUMN message_id TEXT")
-            if "is_owner" not in cols:
-                self._conn.execute(
-                    "ALTER TABLE business_chat_log ADD COLUMN is_owner INTEGER NOT NULL DEFAULT 0")
-                self._conn.execute("UPDATE business_chat_log SET is_owner = 1 WHERE author = 'Owner'")
             self._conn.commit()
 
     def close(self) -> None:
@@ -286,32 +278,33 @@ class BusinessStateDB:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def purge_business_chat_log(self, connection_id: str, customer_chat_id: Optional[str] = None) -> int:
+    def purge_business_chat_log(self, connection_id: str, customer_chat_id: Optional[str] = None) -> None:
         """Forget a chat's log (or every chat of a connection)."""
-        sql, args = "DELETE FROM business_chat_log WHERE connection_id = ?", [str(connection_id)]
-        if customer_chat_id is not None:
-            sql, args = sql + " AND customer_chat_id = ?", args + [str(customer_chat_id)]
         with self._lock:
-            n = self._conn.execute(sql, args).rowcount
+            if customer_chat_id is None:
+                self._conn.execute("DELETE FROM business_chat_log WHERE connection_id = ?",
+                                   (str(connection_id),))
+            else:
+                self._conn.execute(
+                    "DELETE FROM business_chat_log WHERE connection_id = ? AND customer_chat_id = ?",
+                    (str(connection_id), str(customer_chat_id)))
             self._conn.commit()
-            return n
 
     def supersede_pending_telegram_business_drafts(
         self, connection_id: str, customer_chat_id: str,
-    ) -> int:
+    ) -> None:
         """Retire the live draft of one conversation (the owner answered by hand)."""
         with self._lock:
-            n = self._supersede_pending(time.time(), connection_id, customer_chat_id)
+            self._supersede_pending(time.time(), connection_id, customer_chat_id)
             self._conn.commit()
-            return n
 
-    def _supersede_pending(self, now: float, connection_id: str, customer_chat_id: str) -> int:
+    def _supersede_pending(self, now: float, connection_id: str, customer_chat_id: str) -> None:
         """Caller holds ``self._lock`` and commits."""
-        return self._conn.execute(
+        self._conn.execute(
             "UPDATE business_drafts SET status = 'superseded', updated_at = ? "
             "WHERE connection_id = ? AND customer_chat_id = ? AND status = 'pending'",
             (now, str(connection_id), str(customer_chat_id)),
-        ).rowcount
+        )
 
     def get_telegram_business_draft(self, draft_id: int) -> Optional[Dict[str, Any]]:
         with self._lock:
