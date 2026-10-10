@@ -66,6 +66,26 @@ def _hermes_home() -> Path:
     return Path.home() / ".hermes"
 
 
+# The gateway rebuilds the Telegram adapter after a network error and re-runs our factory with the
+# new one; sends must always go through the latest adapter, never one captured at first wiring.
+_BOT_WAIT_SECONDS = 60.0  # how long a send waits for the bot to come back during a reconnect
+
+
+async def _send_via(state: dict, **kwargs):
+    kwargs.setdefault("parse_mode", None)
+    kwargs.setdefault("disable_web_page_preview", True)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _BOT_WAIT_SECONDS
+    while True:
+        adapter = state.get("adapter")
+        bot = getattr(adapter, "_bot", None) or getattr(adapter, "bot", None)
+        if bot is not None:
+            return await bot.send_message(**kwargs)
+        if loop.time() >= deadline:
+            raise RuntimeError("Telegram bot is not connected")
+        await asyncio.sleep(1.0)
+
+
 _CONFIG_KEYS = ("debounce_seconds", "draft_ttl_hours", "max_customer_text_chars", "owner_persona")
 
 
@@ -122,9 +142,9 @@ def register(ctx: Any) -> None:
     logger.info("telegram-business: persona from %s", persona_source)
 
     # Deferred singletons — constructed on first connect so import stays light.
-    _state: dict = {"db": None, "manager": None}
+    _state: dict = {"db": None, "manager": None, "adapter": None}
 
-    def _get_manager(adapter: Any) -> BusinessModeManager:
+    def _get_manager() -> BusinessModeManager:
         if _state["manager"] is not None:
             return _state["manager"]
 
@@ -132,12 +152,7 @@ def register(ctx: Any) -> None:
         _state["db"] = db
 
         async def _send(**kwargs):
-            kwargs.setdefault("parse_mode", None)
-            kwargs.setdefault("disable_web_page_preview", True)
-            bot = getattr(adapter, "_bot", None) or getattr(adapter, "bot", None)
-            if bot is None:
-                raise RuntimeError("Telegram bot is not connected")
-            return await bot.send_message(**kwargs)
+            return await _send_via(_state, **kwargs)
 
         system_prompt = f"{persona}\n\n{DRAFT_OUTPUT_RULES}"
 
@@ -183,7 +198,8 @@ def register(ctx: Any) -> None:
             filters,
         )
 
-        manager = _get_manager(adapter)
+        _state["adapter"] = adapter  # latest wiring wins (see _send_via)
+        manager = _get_manager()
 
         async def _on_business_connection(update, context):
             conn = getattr(update, "business_connection", None)

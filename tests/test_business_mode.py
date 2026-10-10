@@ -1152,3 +1152,14 @@ class TestDraftOutputCleanup:
         await mgr.handle_connection_update(_fake_business_connection())
         await mgr.handle_business_message(_fake_business_message(text="?"))
         assert db.get_pending_telegram_business_drafts_for_owner("100")[0]["draft_text"] == text
+
+
+@pytest.mark.asyncio
+async def test_generation_and_notice_both_failing_leave_a_failed_row(db):
+    sender = _SentRecorder()
+    mgr, _ = _make_manager(db, draft_fails=True, send_recorder=sender)
+    await mgr.handle_connection_update(_fake_business_connection())
+    sender.fail = True                    # the owner notice cannot be delivered either
+    await mgr.handle_business_message(_fake_business_message(text="Free on Friday?"))
+    rows = db._conn.execute("SELECT status, customer_text FROM business_drafts").fetchall()
+    assert [tuple(r) for r in rows] == [("failed", "Free on Friday?")]

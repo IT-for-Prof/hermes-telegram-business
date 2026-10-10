@@ -378,7 +378,12 @@ class BusinessModeManager:
                     disable_notification=True,
                 )
             except Exception:
-                pass
+                # Neither a draft nor the notice reached the owner: keep a row the watchdog reports.
+                self._db.create_telegram_business_draft(
+                    connection_id=buf["conn_id"], owner_chat_id=buf["owner_chat_id"],
+                    customer_chat_id=buf["customer_chat_id"], customer_msg_id=buf["customer_msg_id"] or None,
+                    customer_text=customer_text, draft_text="", status="failed",
+                )
             return
 
         draft_text, skipped = postprocess_draft(draft_text)
