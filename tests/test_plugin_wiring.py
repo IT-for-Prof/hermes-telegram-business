@@ -75,8 +75,26 @@ async def test_send_uses_the_adapter_of_the_latest_wiring():
 
 
 @pytest.mark.asyncio
+async def test_send_waits_until_the_new_adapter_is_connected(monkeypatch):
+    monkeypatch.setattr(plugin, "_BOT_WAIT_SECONDS", 2.0)
+    monkeypatch.setattr(plugin, "_BOT_POLL_SECONDS", 0.05)
+    adapter = SimpleNamespace(_bot=_bot(), is_connected=False)   # bot exists, still connecting
+    state = {"adapter": adapter}
+
+    async def connected():
+        await asyncio.sleep(0.2)
+        assert adapter._bot.send_message.call_count == 0
+        adapter.is_connected = True
+
+    asyncio.get_running_loop().create_task(connected())
+    await plugin._send_via(state, chat_id=1, text="draft")
+    adapter._bot.send_message.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_send_waits_for_the_bot_during_a_reconnect(monkeypatch):
     monkeypatch.setattr(plugin, "_BOT_WAIT_SECONDS", 2.0)
+    monkeypatch.setattr(plugin, "_BOT_POLL_SECONDS", 0.05)
     adapter = SimpleNamespace(_bot=None)
     state = {"adapter": adapter}
 
@@ -92,6 +110,7 @@ async def test_send_waits_for_the_bot_during_a_reconnect(monkeypatch):
 @pytest.mark.asyncio
 async def test_send_fails_loudly_when_no_bot_comes_back(monkeypatch):
     monkeypatch.setattr(plugin, "_BOT_WAIT_SECONDS", 0.2)
+    monkeypatch.setattr(plugin, "_BOT_POLL_SECONDS", 0.05)
     state = {"adapter": SimpleNamespace(_bot=None)}
     with pytest.raises(RuntimeError, match="not connected"):
         await plugin._send_via(state, chat_id=1, text="draft")

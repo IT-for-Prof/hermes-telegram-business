@@ -69,6 +69,7 @@ def _hermes_home() -> Path:
 # The gateway rebuilds the Telegram adapter after a network error and re-runs our factory with the
 # new one; sends must always go through the latest adapter, never one captured at first wiring.
 _BOT_WAIT_SECONDS = 60.0  # how long a send waits for the bot to come back during a reconnect
+_BOT_POLL_SECONDS = 1.0
 
 
 async def _send_via(state: dict, **kwargs):
@@ -78,12 +79,13 @@ async def _send_via(state: dict, **kwargs):
     deadline = loop.time() + _BOT_WAIT_SECONDS
     while True:
         adapter = state.get("adapter")
-        bot = getattr(adapter, "_bot", None) or getattr(adapter, "bot", None)
-        if bot is not None:
+        bot = getattr(adapter, "_bot", None)
+        # A rebuilt adapter gets its bot before it finishes connecting; wait for is_connected too.
+        if bot is not None and getattr(adapter, "is_connected", True):
             return await bot.send_message(**kwargs)
         if loop.time() >= deadline:
             raise RuntimeError("Telegram bot is not connected")
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(_BOT_POLL_SECONDS)
 
 
 _CONFIG_KEYS = ("debounce_seconds", "draft_ttl_hours", "max_customer_text_chars", "owner_persona")
@@ -285,12 +287,8 @@ def register(ctx: Any) -> None:
                 logger.exception("telegram-business: /biz failed: %s", exc)
                 reply = f"⚠️ /biz failed: {exc}"
             try:
-                bot = getattr(adapter, "_bot", None)
-                if bot is not None and chat is not None:
-                    await bot.send_message(
-                        chat_id=chat.id, text=reply,
-                        disable_web_page_preview=True,
-                    )
+                if chat is not None:
+                    await _send_via(_state, chat_id=chat.id, text=reply)
             except Exception:
                 logger.debug("telegram-business: /biz reply send failed", exc_info=True)
 
