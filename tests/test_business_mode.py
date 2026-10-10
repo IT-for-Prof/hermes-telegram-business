@@ -1185,7 +1185,7 @@ class TestLongerContextAndStyle:
         await mgr.handle_business_message(_owner_msg("ок, гляну вечером", customer_chat_id=300, msg_id=501))
         await mgr.handle_business_message(_fake_business_message(customer_chat_id=200, text="question B", msg_id=2))
         prompt = prompts[-1]
-        assert "ок, гляну вечером" in prompt and "draft" in prompt
+        assert "- ок, гляну вечером" in prompt
         assert "secret question A" not in prompt                      # no cross-chat contact text
 
     @pytest.mark.asyncio
@@ -1213,16 +1213,16 @@ class TestLongerContextAndStyle:
         await mgr.handle_business_message(_owner_msg("ответ в другом чате", customer_chat_id=300, msg_id=502))
         await mgr.handle_business_message(_fake_business_message(customer_chat_id=200, text="q3", msg_id=3))
         prompt = prompts[-1]
-        assert prompt.count("ответ в этом чате") == 1 and "owner wrote instead: ответ в другом чате" in prompt
+        assert prompt.count("ответ в этом чате") == 1 and "- ответ в другом чате" in prompt
 
 
 class _FakeMemory:
-    def __init__(self, notes="", fail=False):
-        self.notes, self.fail = notes, fail
+    def __init__(self, notes="", fail=False, fail_forget=False):
+        self.notes, self.fail, self.fail_forget = notes, fail, fail_forget
         self.remembered, self.forgotten, self.recalls = [], [], []
 
     def remember(self, conn_id, chat_id, is_owner, text, history):
-        self.remembered.append((chat_id, is_owner, text, list(history())))
+        self.remembered.append((chat_id, is_owner, text, list(history)))
 
     def recall(self, conn_id, chat_id, query):
         self.recalls.append((chat_id, query))
@@ -1231,6 +1231,8 @@ class _FakeMemory:
         return self.notes
 
     def forget(self, conn_id, chat_ids):
+        if self.fail_forget:
+            raise RuntimeError("honcho down")
         self.forgotten.append(sorted(chat_ids))
 
 
@@ -1276,6 +1278,7 @@ class TestContactMemory:
         await mgr.handle_business_message(_owner_msg("hello", msg_id=501))
         await asyncio.sleep(0.05)                 # remember() runs in the background
         assert [(c, o, t) for c, o, t, _ in memory.remembered] == [("200", False, "hi"), ("200", True, "hello")]
+        assert memory.remembered[0][3] == [(False, "hi")]          # history snapshot taken when queued
         assert memory.remembered[-1][3] == [(False, "hi"), (True, "hello")]
         await mgr.handle_biz_command(owner_user_id="42", owner_chat_id="100", args=["off", "200"])
         await mgr.handle_business_message(_fake_business_message(text="muted now", msg_id=2))
@@ -1296,39 +1299,97 @@ class TestContactMemory:
 
 
 def test_contact_memory_against_a_fake_honcho():
-    """memory.py wiring: peers configured before the first message, history seeded once, forget clears the card."""
+    """memory.py wiring: peers before the first message, seed once in chunks of 100, recall never seeds, forget wipes."""
     from telegram_business_plugin.memory import ContactMemory
 
     class Page:
         def __init__(self, items): self.items = items
 
     class FakeSession:
-        def __init__(self): self.peers, self.msgs, self.deleted = None, [], False
+        def __init__(self): self.peers, self.msgs, self.deleted, self.batches = None, [], False, []
         def add_peers(self, peers): self.peers = peers
         def messages(self, size=50): return Page(self.msgs[:size])
-        def add_messages(self, msgs): self.msgs += msgs
+        def add_messages(self, msgs):
+            assert len(msgs) <= 100
+            self.batches.append(len(msgs)); self.msgs += msgs
         def context(self, **kw):
             return SimpleNamespace(peer_card=["works at X"], peer_representation="likes tea",
                                    summary=SimpleNamespace(content="talked about SIM cards"))
         def delete(self): self.deleted = True
 
+    class Conclusions:
+        def __init__(self): self.items = [SimpleNamespace(id="a"), SimpleNamespace(id="b")]
+        def list(self, size=50): return Page(list(self.items))
+        def delete(self, cid): self.items = [c for c in self.items if c.id != cid]
+
     class FakePeer:
-        def __init__(self, pid, cards): self.pid, self.cards = pid, cards
+        def __init__(self, pid, h): self.pid, self.h = pid, h; self.conclusions = h.conclusions.setdefault(pid, Conclusions())
         def message(self, text): return (self.pid, text)
-        def set_card(self, card): self.cards[self.pid] = card
+        def set_card(self, card): self.h.cards[self.pid] = card
 
     class FakeHoncho:
-        def __init__(self): self.sessions, self.cards = {}, {}
+        def __init__(self): self.sessions, self.cards, self.conclusions = {}, {}, {}
         def session(self, sid): return self.sessions.setdefault(sid, FakeSession())
-        def peer(self, pid): return FakePeer(pid, self.cards)
+        def peer(self, pid): return FakePeer(pid, self)
 
     honcho = FakeHoncho()
     mem = ContactMemory(honcho, lambda **kw: kw)
-    mem.remember("c1", "200", False, "second", lambda: [(False, "first"), (False, "second")])
-    mem.remember("c1", "200", True, "reply", lambda: [])
+    assert "likes tea" in mem.recall("c1", "200", "q")            # cold recall: no peers added, nothing seeded
+    contact = mem.contact_peer("c1", "200")
+    history = [(False, f"m{i}") for i in range(150)]
+    mem.remember("c1", "200", False, "m149", history)
+    mem.remember("c1", "200", True, "reply", [])
     s = honcho.sessions["tgbiz-c1-200"]
     assert s.peers[0] == ("tgbiz_owner", {"observe_me": False, "observe_others": False})
-    assert s.msgs == [("tgbiz_200", "first"), ("tgbiz_200", "second"), ("tgbiz_owner", "reply")]
-    assert "likes tea" in mem.recall("c1", "200", "q") and "works at X" in mem.recall("c1", "200", "q")
+    assert s.batches == [100, 50, 1] and s.msgs[-1] == ("tgbiz_owner", "reply") and s.msgs[0] == (contact, "m0")
     mem.forget("c1", ["200"])
-    assert s.deleted and honcho.cards["tgbiz_200"] == []
+    assert s.deleted and honcho.cards[contact] == [] and honcho.conclusions[contact].items == []
+
+
+
+@pytest.mark.asyncio
+async def test_failed_forget_is_retried_and_blocks_recall_until_done(db):
+    memory = _FakeMemory(notes="- old facts", fail_forget=True)
+    mgr, prompts = _memory_manager(db, memory)
+    await mgr.handle_connection_update(_fake_business_connection())
+    await mgr.handle_biz_command(owner_user_id="42", owner_chat_id="100", args=["off", "200"])
+    await mgr.handle_biz_command(owner_user_id="42", owner_chat_id="100", args=["on", "200"])
+    await mgr.handle_business_message(_fake_business_message(text="back again", msg_id=1))
+    await asyncio.sleep(0.05)
+    assert "old facts" not in prompts[-1]                  # muted chat's memory not used while forget is pending
+    memory.fail_forget = False
+    await mgr.handle_business_message(_fake_business_message(text="and now?", msg_id=2))
+    await asyncio.sleep(0.05)
+    assert memory.forgotten == [["200"]]
+    assert db.pending_forgets() == []
+
+
+@pytest.mark.asyncio
+async def test_examples_never_show_other_chats_drafts(db):
+    from telegram_business_plugin.manager import BusinessModeManager
+    prompts = []
+
+    async def _draft(prompt_text, chat_id):
+        prompts.append(prompt_text)
+        return f"generated-for-{chat_id}"
+
+    mgr = BusinessModeManager(session_db=db, send_message=_SentRecorder(), draft_generator=_draft, debounce_seconds=0.0)
+    await mgr.handle_connection_update(_fake_business_connection())
+    await mgr.handle_business_message(_fake_business_message(customer_chat_id=300, text="q", msg_id=1))
+    await mgr.handle_business_message(_owner_msg("мой вариант ответа", customer_chat_id=300, msg_id=501))
+    await mgr.handle_business_message(_fake_business_message(customer_chat_id=200, text="q2", msg_id=2))
+    assert "мой вариант ответа" in prompts[-1] and "generated-for-300" not in prompts[-1]
+
+
+@pytest.mark.asyncio
+async def test_examples_come_only_from_the_same_owner(db):
+    mgr, sender, prompts = _capturing_manager(db)
+    await mgr.handle_connection_update(_fake_business_connection(conn_id="other", owner_id=77, owner_chat=700))
+    await mgr.handle_business_message(_fake_business_message(conn_id="other", customer_chat_id=300, text="q", msg_id=1))
+    await mgr.handle_business_message(SimpleNamespace(**{**vars(_fake_business_message(
+        conn_id="other", customer_chat_id=300, customer_id=77, text="ответ другого владельца", msg_id=501))}))
+    await mgr.handle_connection_update(_fake_business_connection())
+    await mgr.handle_business_message(_fake_business_message(customer_chat_id=200, text="q2", msg_id=2))
+    rows = db._conn.execute("SELECT status, final_sent_text FROM business_drafts WHERE connection_id='other'").fetchall()
+    assert [tuple(r) for r in rows] == [("replied", "ответ другого владельца")]   # the example really exists
+    assert "ответ другого владельца" not in prompts[-1]

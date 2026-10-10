@@ -20,7 +20,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS business_connections (
@@ -68,6 +68,12 @@ CREATE TABLE IF NOT EXISTS business_chat_log (
     created_at REAL NOT NULL,
     message_id TEXT,
     is_owner INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS business_pending_forgets (
+    connection_id TEXT NOT NULL,
+    customer_chat_id TEXT NOT NULL,
+    PRIMARY KEY (connection_id, customer_chat_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_biz_log_chat
@@ -280,16 +286,35 @@ class BusinessStateDB:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def get_reply_examples(self, limit: int = 20) -> List[Dict[str, Any]]:
-        """Latest drafts the owner replaced with his own words (``replied``/``edited``), newest first."""
+    def get_reply_examples(self, owner_user_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """This owner's latest replies that replaced a draft (``replied``/``edited``), newest first."""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT connection_id, customer_chat_id, draft_text, final_sent_text FROM business_drafts "
-                "WHERE status IN ('replied', 'edited') AND coalesce(final_sent_text, '') != '' "
-                "AND draft_text != '' AND final_sent_text != draft_text ORDER BY updated_at DESC LIMIT ?",
-                (int(limit),),
+                "SELECT d.connection_id, d.customer_chat_id, d.final_sent_text FROM business_drafts d "
+                "JOIN business_connections c ON c.connection_id = d.connection_id "
+                "WHERE c.owner_user_id = ? AND d.status IN ('replied', 'edited') "
+                "AND coalesce(d.final_sent_text, '') != '' AND d.draft_text != '' AND d.final_sent_text != d.draft_text "
+                "ORDER BY d.updated_at DESC LIMIT ?",
+                (str(owner_user_id), int(limit)),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def add_pending_forgets(self, connection_id: str, chat_ids: List[str]) -> None:
+        with self._lock:
+            self._conn.executemany("INSERT OR IGNORE INTO business_pending_forgets VALUES (?, ?)",
+                                   [(str(connection_id), str(c)) for c in chat_ids])
+            self._conn.commit()
+
+    def clear_pending_forgets(self, connection_id: str, chat_ids: List[str]) -> None:
+        with self._lock:
+            self._conn.executemany("DELETE FROM business_pending_forgets WHERE connection_id = ? AND customer_chat_id = ?",
+                                   [(str(connection_id), str(c)) for c in chat_ids])
+            self._conn.commit()
+
+    def pending_forgets(self) -> List[Tuple[str, str]]:
+        with self._lock:
+            return [tuple(r) for r in self._conn.execute(
+                "SELECT connection_id, customer_chat_id FROM business_pending_forgets ORDER BY 1, 2").fetchall()]
 
     def chats_in_log(self, connection_id: str) -> List[str]:
         with self._lock:
