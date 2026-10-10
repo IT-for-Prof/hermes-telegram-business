@@ -291,6 +291,12 @@ class BusinessStateDB:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def chats_in_log(self, connection_id: str) -> List[str]:
+        with self._lock:
+            rows = self._conn.execute("SELECT DISTINCT customer_chat_id FROM business_chat_log WHERE connection_id = ?",
+                                      (str(connection_id),)).fetchall()
+        return sorted(r[0] for r in rows)
+
     def purge_business_chat_log(self, connection_id: str, customer_chat_id: Optional[str] = None) -> None:
         """Forget a chat's log and its draft texts (or those of every chat of a connection).
 

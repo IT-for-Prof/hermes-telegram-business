@@ -1214,3 +1214,121 @@ class TestLongerContextAndStyle:
         await mgr.handle_business_message(_fake_business_message(customer_chat_id=200, text="q3", msg_id=3))
         prompt = prompts[-1]
         assert prompt.count("ответ в этом чате") == 1 and "owner wrote instead: ответ в другом чате" in prompt
+
+
+class _FakeMemory:
+    def __init__(self, notes="", fail=False):
+        self.notes, self.fail = notes, fail
+        self.remembered, self.forgotten, self.recalls = [], [], []
+
+    def remember(self, conn_id, chat_id, is_owner, text, history):
+        self.remembered.append((chat_id, is_owner, text, list(history())))
+
+    def recall(self, conn_id, chat_id, query):
+        self.recalls.append((chat_id, query))
+        if self.fail:
+            raise RuntimeError("honcho down")
+        return self.notes
+
+    def forget(self, conn_id, chat_ids):
+        self.forgotten.append(sorted(chat_ids))
+
+
+def _memory_manager(db, memory):
+    from telegram_business_plugin.manager import BusinessModeManager
+    prompts = []
+
+    async def _draft(prompt_text, customer_chat_id):
+        prompts.append(prompt_text)
+        return "draft"
+
+    mgr = BusinessModeManager(session_db=db, send_message=_SentRecorder(), draft_generator=_draft,
+                              debounce_seconds=0.0, memory=memory)
+    return mgr, prompts
+
+
+class TestContactMemory:
+    """U5: Honcho notes about the contact reach the draft; memory failures never block a draft."""
+
+    @pytest.mark.asyncio
+    async def test_notes_reach_the_prompt_as_unverified(self, db):
+        memory = _FakeMemory(notes="- prefers short answers")
+        mgr, prompts = _memory_manager(db, memory)
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message(text="any news?"))
+        assert "prefers short answers" in prompts[-1]
+        assert "may be wrong" in prompts[-1]
+        assert memory.recalls == [("200", "any news?")]
+
+    @pytest.mark.asyncio
+    async def test_memory_failure_still_drafts(self, db):
+        mgr, prompts = _memory_manager(db, _FakeMemory(fail=True))
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message(text="any news?"))
+        assert prompts and "may be wrong" not in prompts[-1]
+
+    @pytest.mark.asyncio
+    async def test_both_sides_are_remembered_with_history_but_not_muted_chats(self, db):
+        memory = _FakeMemory()
+        mgr, prompts = _memory_manager(db, memory)
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message(text="hi", msg_id=1))
+        await mgr.handle_business_message(_owner_msg("hello", msg_id=501))
+        await asyncio.sleep(0.05)                 # remember() runs in the background
+        assert [(c, o, t) for c, o, t, _ in memory.remembered] == [("200", False, "hi"), ("200", True, "hello")]
+        assert memory.remembered[-1][3] == [(False, "hi"), (True, "hello")]
+        await mgr.handle_biz_command(owner_user_id="42", owner_chat_id="100", args=["off", "200"])
+        await mgr.handle_business_message(_fake_business_message(text="muted now", msg_id=2))
+        await asyncio.sleep(0.05)
+        assert all(t != "muted now" for _, _, t, _ in memory.remembered)
+        assert memory.forgotten == [["200"]]
+
+    @pytest.mark.asyncio
+    async def test_disconnect_forgets_every_logged_chat(self, db):
+        memory = _FakeMemory()
+        mgr, prompts = _memory_manager(db, memory)
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message(customer_chat_id=200, text="a", msg_id=1))
+        await mgr.handle_business_message(_fake_business_message(customer_chat_id=300, text="b", msg_id=2))
+        await mgr.handle_connection_update(_fake_business_connection(is_enabled=False))
+        await asyncio.sleep(0.05)
+        assert memory.forgotten == [["200", "300"]]
+
+
+def test_contact_memory_against_a_fake_honcho():
+    """memory.py wiring: peers configured before the first message, history seeded once, forget clears the card."""
+    from telegram_business_plugin.memory import ContactMemory
+
+    class Page:
+        def __init__(self, items): self.items = items
+
+    class FakeSession:
+        def __init__(self): self.peers, self.msgs, self.deleted = None, [], False
+        def add_peers(self, peers): self.peers = peers
+        def messages(self, size=50): return Page(self.msgs[:size])
+        def add_messages(self, msgs): self.msgs += msgs
+        def context(self, **kw):
+            return SimpleNamespace(peer_card=["works at X"], peer_representation="likes tea",
+                                   summary=SimpleNamespace(content="talked about SIM cards"))
+        def delete(self): self.deleted = True
+
+    class FakePeer:
+        def __init__(self, pid, cards): self.pid, self.cards = pid, cards
+        def message(self, text): return (self.pid, text)
+        def set_card(self, card): self.cards[self.pid] = card
+
+    class FakeHoncho:
+        def __init__(self): self.sessions, self.cards = {}, {}
+        def session(self, sid): return self.sessions.setdefault(sid, FakeSession())
+        def peer(self, pid): return FakePeer(pid, self.cards)
+
+    honcho = FakeHoncho()
+    mem = ContactMemory(honcho, lambda **kw: kw)
+    mem.remember("c1", "200", False, "second", lambda: [(False, "first"), (False, "second")])
+    mem.remember("c1", "200", True, "reply", lambda: [])
+    s = honcho.sessions["tgbiz-c1-200"]
+    assert s.peers[0] == ("tgbiz_owner", {"observe_me": False, "observe_others": False})
+    assert s.msgs == [("tgbiz_200", "first"), ("tgbiz_200", "second"), ("tgbiz_owner", "reply")]
+    assert "likes tea" in mem.recall("c1", "200", "q") and "works at X" in mem.recall("c1", "200", "q")
+    mem.forget("c1", ["200"])
+    assert s.deleted and honcho.cards["tgbiz_200"] == []

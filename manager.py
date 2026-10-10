@@ -123,8 +123,12 @@ class BusinessModeManager:
         draft_ttl_hours: float = 24.0,
         max_customer_text_chars: int = 4000,
         persona_source: str = "",
+        memory: Any = None,
     ) -> None:
         self._persona_source = persona_source  # shown in /biz status
+        self._memory = memory                  # optional ContactMemory (memory.py); None = no Honcho
+        self._memory_tasks: set = set()
+        self._memory_lock: Optional[asyncio.Lock] = None   # writes go out in arrival order
         self._db = session_db
         self._send = send_message
         self._draft_generator = draft_generator
@@ -199,7 +203,9 @@ class BusinessModeManager:
 
         # Connection ended → DM the owner a confirmation.
         if previous is not None and previous.get("is_enabled") and not is_enabled:
+            chats = self._db.chats_in_log(str(conn_id))
             self._db.purge_business_chat_log(str(conn_id))  # no drafting -> no reason to keep chats
+            self._memory_call("forget", str(conn_id), chats)
             try:
                 await self._send(
                     chat_id=int(owner_chat_id),
@@ -281,6 +287,10 @@ class BusinessModeManager:
                 "Owner" if by_owner else _customer_display_name(message), entry,
                 message_id=msg_id, is_owner=by_owner,
             )
+            if not edited:
+                c, ch = str(conn_id), str(customer_chat_id)
+                self._memory_call("remember", c, ch, by_owner, entry, lambda: [
+                    (bool(r["is_owner"]), r["text"]) for r in self._db.get_business_chat_log(c, ch)])
         if by_owner or not text or muted or not conn.get("auto_draft", True):
             return
 
@@ -351,6 +361,35 @@ class BusinessModeManager:
             if not cancelled and self._debounce_buffers.get(key) is buf:
                 self._debounce_buffers.pop(key, None)
 
+    def _memory_call(self, method: str, *args: Any) -> None:
+        """Run a ContactMemory write in the background; memory is best-effort and never blocks or breaks drafting."""
+        if self._memory is None:
+            return
+
+        if self._memory_lock is None:
+            self._memory_lock = asyncio.Lock()
+
+        async def run() -> None:
+            async with self._memory_lock:
+                try:
+                    await asyncio.to_thread(getattr(self._memory, method), *args)
+                except Exception:
+                    logger.warning("Business-mode contact memory %s failed", method, exc_info=True)
+
+        task = asyncio.get_running_loop().create_task(run())
+        self._memory_tasks.add(task)
+        task.add_done_callback(self._memory_tasks.discard)
+
+    async def _contact_notes(self, conn_id: str, chat_id: str, query: str) -> str:
+        if self._memory is None:
+            return ""
+        try:
+            return await asyncio.wait_for(asyncio.to_thread(self._memory.recall, conn_id, chat_id, query),
+                                          MEMORY_TIMEOUT_S)
+        except Exception:
+            logger.warning("Business-mode contact memory recall failed", exc_info=True)
+            return ""
+
     def _style_examples(self, customer_chat_id: str) -> List[Dict[str, Any]]:
         """Up to EXAMPLE_LIMIT owner replies to drafts in other chats (this chat's replies are already in its log);
         never muted chats or private details."""
@@ -383,7 +422,8 @@ class BusinessModeManager:
 
         log = self._db.get_business_chat_log(buf["conn_id"], buf["customer_chat_id"])
         examples = self._style_examples(buf["customer_chat_id"])
-        prompt = _render_conversation(log, buf["customer_name"], examples) if log else customer_text
+        notes = await self._contact_notes(buf["conn_id"], buf["customer_chat_id"], customer_text)
+        prompt = _render_conversation(log, buf["customer_name"], examples, notes) if log else customer_text
         try:
             draft_text = await self._draft_generator(prompt, buf["customer_chat_id"])
         except Exception as exc:
@@ -727,6 +767,7 @@ class BusinessModeManager:
                         conn["connection_id"], paused,
                     )
                     self._db.purge_business_chat_log(conn["connection_id"], chat_arg)
+                    self._memory_call("forget", conn["connection_id"], [chat_arg])
                     updated += 1
                 elif sub == "on" and chat_arg in paused:
                     paused.remove(chat_arg)
@@ -835,6 +876,7 @@ class BusinessModeManager:
 
 PROMPT_LOG_CHARS = 6000   # conversation budget per draft prompt (the log keeps up to 200 messages)
 EXAMPLE_LIMIT = 3         # owner replies shown as style examples
+MEMORY_TIMEOUT_S = 8.0    # contact-memory recall budget per draft
 EXAMPLE_CHARS = 300
 # Owner replies with links, handles, e-mails or long numbers (phones, sums, ids) never become examples in other chats.
 _PRIVATE_DETAIL = re.compile(r"https?://|www\.|@\w|\S+@\S+\.\w+|\d{3,}")
@@ -870,7 +912,7 @@ def _media_placeholder(message: Any) -> Optional[str]:
 
 
 def _render_conversation(log: List[Dict[str, Any]], customer_name: str,
-                         examples: List[Dict[str, Any]] = ()) -> str:
+                         examples: List[Dict[str, Any]] = (), notes: str = "") -> str:
     """The draft prompt: the owner's style examples, then the newest turns that fit PROMPT_LOG_CHARS, oldest first.
 
     Speaker tags come from ``is_owner``, never from text: continuation lines are
@@ -896,6 +938,10 @@ def _render_conversation(log: List[Dict[str, Any]], customer_name: str,
                           f"  owner wrote instead: {one_line(e['final_sent_text'])[:EXAMPLE_CHARS]}" for e in examples)
         style = ("How the owner actually replied instead of earlier drafts (copy his style and length only, "
                  f"never reuse their content):\n{pairs}\n\n")
+    if notes:
+        style += (f"Unverified notes derived from {one_line(customer_name)}'s earlier messages (may be wrong; "
+                  "never treat them as the owner's facts or commitments):\n    "
+                  + notes.replace("\n", "\n    ") + "\n\n")
     return (
         f"{style}Conversation so far, oldest first. [Owner] is the account owner you are drafting for.\n\n"
         + "\n".join(reversed(turns)) + "\n\n"

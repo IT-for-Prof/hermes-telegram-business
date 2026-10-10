@@ -30,6 +30,7 @@ from typing import Any
 try:  # Normal package import (Hermes plugin loader, tests via conftest alias)
     from .manager import BusinessModeManager, CALLBACK_PREFIX, DRAFT_OUTPUT_RULES
     from .state import BusinessStateDB
+    from .memory import load as load_contact_memory
 except ImportError:  # pragma: no cover - loaded as a bare module (no package)
     import importlib.util as _ilu
     import sys as _sys
@@ -48,6 +49,7 @@ except ImportError:  # pragma: no cover - loaded as a bare module (no package)
     CALLBACK_PREFIX = _manager_mod.CALLBACK_PREFIX
     DRAFT_OUTPUT_RULES = _manager_mod.DRAFT_OUTPUT_RULES
     BusinessStateDB = _state_mod.BusinessStateDB
+    load_contact_memory = _load("memory").load
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +154,12 @@ def register(ctx: Any) -> None:
 
         db = BusinessStateDB(_hermes_home() / "telegram-business" / "state.db")
         _state["db"] = db
+        try:
+            memory = load_contact_memory(_hermes_home())
+        except Exception as exc:
+            logger.warning("telegram-business: contact memory disabled: %s", exc)
+            memory = None
+        logger.info("telegram-business: contact memory %s", "on (Honcho)" if memory else "off")
 
         async def _send(**kwargs):
             return await _send_via(_state, **kwargs)
@@ -183,6 +191,7 @@ def register(ctx: Any) -> None:
             draft_ttl_hours=ttl_hours,
             max_customer_text_chars=max_chars,
             persona_source=persona_source,
+            memory=memory,
         )
         return _state["manager"]
 
