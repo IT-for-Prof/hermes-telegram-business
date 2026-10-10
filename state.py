@@ -245,7 +245,7 @@ class BusinessStateDB:
 
     def log_business_message(
         self, connection_id: str, customer_chat_id: str, author: str, text: str, *,
-        message_id: Optional[str] = None, is_owner: bool = False, keep: int = 20,
+        message_id: Optional[str] = None, is_owner: bool = False, keep: int = 200,
     ) -> None:
         """Record one message of a chat (an edit replaces its row) and keep the newest ``keep``."""
         conn_id, chat_id = str(connection_id), str(customer_chat_id)
@@ -277,6 +277,17 @@ class BusinessStateDB:
                 "SELECT author, text, is_owner FROM business_chat_log WHERE connection_id = ? "
                 "AND customer_chat_id = ? ORDER BY id",
                 (str(connection_id), str(customer_chat_id)),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_reply_examples(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """Latest drafts the owner replaced with his own words (``replied``/``edited``), newest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT connection_id, customer_chat_id, draft_text, final_sent_text FROM business_drafts "
+                "WHERE status IN ('replied', 'edited') AND coalesce(final_sent_text, '') != '' "
+                "AND draft_text != '' AND final_sent_text != draft_text ORDER BY updated_at DESC LIMIT ?",
+                (int(limit),),
             ).fetchall()
         return [dict(r) for r in rows]
 

@@ -823,10 +823,10 @@ class TestConversationContext:
         assert "[Owner] sent via Send" in prompts[-1]
 
     def test_chat_log_is_capped(self, db):
-        for i in range(25):
-            db.log_business_message("conn1", "200", "Carol", f"m{i}", message_id=str(i), keep=20)
+        for i in range(210):
+            db.log_business_message("conn1", "200", "Carol", f"m{i}", message_id=str(i))
         log = db.get_business_chat_log("conn1", "200")
-        assert [r["text"] for r in log] == [f"m{i}" for i in range(5, 25)]
+        assert [r["text"] for r in log] == [f"m{i}" for i in range(10, 210)]   # default keeps 200
 
 
 class TestBotChats:
@@ -1163,3 +1163,54 @@ async def test_generation_and_notice_both_failing_leave_a_failed_row(db):
     await mgr.handle_business_message(_fake_business_message(text="Free on Friday?"))
     rows = db._conn.execute("SELECT status, customer_text FROM business_drafts").fetchall()
     assert [tuple(r) for r in rows] == [("failed", "Free on Friday?")]
+
+
+
+class TestLongerContextAndStyle:
+    """U4: a longer conversation window within a prompt budget; U2: the owner's real replies as style examples."""
+
+    def test_prompt_keeps_the_newest_turns_within_budget(self):
+        from telegram_business_plugin.manager import _render_conversation, PROMPT_LOG_CHARS
+        log = [{"author": "Carol", "text": f"message {i} " + "x" * 90, "is_owner": i % 2 == 0} for i in range(300)]
+        prompt = _render_conversation(log, "Carol")
+        assert "message 299 " in prompt and "message 0 " not in prompt
+        assert len(prompt) < PROMPT_LOG_CHARS + 2000
+        assert prompt.index("message 290 ") < prompt.index("message 299 ")          # still oldest first
+
+    @pytest.mark.asyncio
+    async def test_owner_replies_become_style_examples_without_contact_text(self, db):
+        mgr, sender, prompts = _capturing_manager(db)
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message(customer_chat_id=300, text="secret question A", msg_id=1))
+        await mgr.handle_business_message(_owner_msg("ок, гляну вечером", customer_chat_id=300, msg_id=501))
+        await mgr.handle_business_message(_fake_business_message(customer_chat_id=200, text="question B", msg_id=2))
+        prompt = prompts[-1]
+        assert "ок, гляну вечером" in prompt and "draft" in prompt
+        assert "secret question A" not in prompt                      # no cross-chat contact text
+
+    @pytest.mark.asyncio
+    async def test_examples_skip_muted_chats_and_private_details(self, db):
+        mgr, sender, prompts = _capturing_manager(db)
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message(customer_chat_id=300, text="q", msg_id=1))
+        await mgr.handle_business_message(_owner_msg("мой номер 99123456", customer_chat_id=300, msg_id=501))
+        await mgr.handle_business_message(_fake_business_message(customer_chat_id=400, text="q", msg_id=2))
+        await mgr.handle_business_message(_owner_msg("пиши на a@b.cy", customer_chat_id=400, msg_id=502))
+        await mgr.handle_business_message(_fake_business_message(customer_chat_id=500, text="q", msg_id=3))
+        await mgr.handle_business_message(_owner_msg("из заглушенного чата", customer_chat_id=500, msg_id=503))
+        await mgr.handle_biz_command(owner_user_id="42", owner_chat_id="100", args=["off", "500"])
+        await mgr.handle_business_message(_fake_business_message(customer_chat_id=200, text="question", msg_id=4))
+        prompt = prompts[-1]
+        assert "99123456" not in prompt and "a@b.cy" not in prompt and "из заглушенного чата" not in prompt
+
+    @pytest.mark.asyncio
+    async def test_replies_from_this_chat_are_not_repeated_as_examples(self, db):
+        mgr, sender, prompts = _capturing_manager(db)
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message(customer_chat_id=200, text="q1", msg_id=1))
+        await mgr.handle_business_message(_owner_msg("ответ в этом чате", customer_chat_id=200, msg_id=501))
+        await mgr.handle_business_message(_fake_business_message(customer_chat_id=300, text="q2", msg_id=2))
+        await mgr.handle_business_message(_owner_msg("ответ в другом чате", customer_chat_id=300, msg_id=502))
+        await mgr.handle_business_message(_fake_business_message(customer_chat_id=200, text="q3", msg_id=3))
+        prompt = prompts[-1]
+        assert prompt.count("ответ в этом чате") == 1 and "owner wrote instead: ответ в другом чате" in prompt

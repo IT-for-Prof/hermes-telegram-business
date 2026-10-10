@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import string
 import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
@@ -350,6 +351,25 @@ class BusinessModeManager:
             if not cancelled and self._debounce_buffers.get(key) is buf:
                 self._debounce_buffers.pop(key, None)
 
+    def _style_examples(self, customer_chat_id: str) -> List[Dict[str, Any]]:
+        """Up to EXAMPLE_LIMIT owner replies to drafts in other chats (this chat's replies are already in its log);
+        never muted chats or private details."""
+        try:
+            conns: Dict[str, Any] = {}
+            picked = []
+            for row in self._db.get_reply_examples():
+                conn = conns.setdefault(row["connection_id"],
+                                        self._db.get_telegram_business_connection(row["connection_id"]))
+                if (row["customer_chat_id"] == customer_chat_id or not conn or not conn.get("is_enabled")
+                        or row["customer_chat_id"] in (conn.get("paused_chats") or [])
+                        or _PRIVATE_DETAIL.search(row["final_sent_text"])):
+                    continue
+                picked.append(row)
+            return picked[:EXAMPLE_LIMIT]
+        except Exception:
+            logger.warning("Business-mode style examples unavailable", exc_info=True)
+            return []
+
     async def _draft_from_buffer(self, key: str, buf: Dict[str, Any]) -> None:
         customer_text = "\n".join(ptext for _, ptext in buf["parts"])[-self._max_customer_text_chars:]
 
@@ -362,7 +382,8 @@ class BusinessModeManager:
             return
 
         log = self._db.get_business_chat_log(buf["conn_id"], buf["customer_chat_id"])
-        prompt = _render_conversation(log, buf["customer_name"]) if log else customer_text
+        examples = self._style_examples(buf["customer_chat_id"])
+        prompt = _render_conversation(log, buf["customer_name"], examples) if log else customer_text
         try:
             draft_text = await self._draft_generator(prompt, buf["customer_chat_id"])
         except Exception as exc:
@@ -812,6 +833,12 @@ class BusinessModeManager:
 # ---------------------------------------------------------------------------
 
 
+PROMPT_LOG_CHARS = 6000   # conversation budget per draft prompt (the log keeps up to 200 messages)
+EXAMPLE_LIMIT = 3         # owner replies shown as style examples
+EXAMPLE_CHARS = 300
+# Owner replies with links, handles, e-mails or long numbers (phones, sums, ids) never become examples in other chats.
+_PRIVATE_DETAIL = re.compile(r"https?://|www\.|@\w|\S+@\S+\.\w+|\d{3,}")
+
 # Appended to the owner persona to form the drafting system prompt.
 DRAFT_OUTPUT_RULES = (
     "Output only the message text. No preamble, no quotes, no "
@@ -842,8 +869,9 @@ def _media_placeholder(message: Any) -> Optional[str]:
     return next((label for attr, label in _MEDIA_LABELS if getattr(message, attr, None)), None)
 
 
-def _render_conversation(log: List[Dict[str, Any]], customer_name: str) -> str:
-    """The draft prompt: the recent conversation, oldest first.
+def _render_conversation(log: List[Dict[str, Any]], customer_name: str,
+                         examples: List[Dict[str, Any]] = ()) -> str:
+    """The draft prompt: the owner's style examples, then the newest turns that fit PROMPT_LOG_CHARS, oldest first.
 
     Speaker tags come from ``is_owner``, never from text: continuation lines are
     indented and names flattened, so a contact can't forge an ``[Owner]`` turn.
@@ -855,10 +883,22 @@ def _render_conversation(log: List[Dict[str, Any]], customer_name: str) -> str:
         who = "[Owner]" if r.get("is_owner") else f"[Contact: {one_line(r['author'])}]"
         return f"{who} " + str(r["text"]).replace("\n", "\n    ")
 
-    lines = "\n".join(turn(r) for r in log)
+    turns, size = [], 0
+    for r in reversed(log):
+        t = turn(r)
+        if turns and size + len(t) > PROMPT_LOG_CHARS:
+            break
+        turns.append(t)
+        size += len(t) + 1
+    style = ""
+    if examples:
+        pairs = "\n".join(f"- draft: {one_line(e['draft_text'])[:EXAMPLE_CHARS]}\n"
+                          f"  owner wrote instead: {one_line(e['final_sent_text'])[:EXAMPLE_CHARS]}" for e in examples)
+        style = ("How the owner actually replied instead of earlier drafts (copy his style and length only, "
+                 f"never reuse their content):\n{pairs}\n\n")
     return (
-        "Conversation so far, oldest first. [Owner] is the account owner you are drafting for.\n\n"
-        f"{lines}\n\n"
+        f"{style}Conversation so far, oldest first. [Owner] is the account owner you are drafting for.\n\n"
+        + "\n".join(reversed(turns)) + "\n\n"
         f"Draft the owner's reply to the latest message(s) from {one_line(customer_name)}."
     )
 
