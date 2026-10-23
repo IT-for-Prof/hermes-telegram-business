@@ -1354,7 +1354,7 @@ def test_contact_memory_against_a_fake_honcho():
     mem = ContactMemory(honcho, lambda **kw: kw)
     notes = mem.recall("c1", "200", "q")                          # cold recall: no peers added, nothing seeded
     assert notes.startswith("- works at X\nEarlier in this chat: talked about SIM cards\nlikes tea")
-    assert len(notes) == 4000                                      # the summary survives a huge representation
+    assert len(notes) == 4000
     contact = mem.contact_peer("c1", "200")
     history = [(False, f"m{i}") for i in range(150)]
     mem.remember("c1", "200", False, "m149", history)

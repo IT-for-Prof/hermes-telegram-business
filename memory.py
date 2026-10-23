@@ -19,9 +19,9 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, List, Optional, Tuple
 
 OWNER_PEER = "tgbiz_owner"
-RECALL_TOP_K = 10               # conclusions semantically closest to the new message
+RECALL_TOP_K = 10
 RECALL_MAX_CONCLUSIONS = 20
-RECALL_SUMMARY_CHARS = 1500     # a long summary reaches 13k chars; keep room for the conclusions
+RECALL_SUMMARY_CHARS = 1500
 RECALL_CHARS = 4000
 
 
@@ -87,7 +87,7 @@ class ContactMemory:
         ctx = session.context(peer_target=self.contact_peer(conn_id, chat_id), search_query=query[:500] or None,
                               search_top_k=RECALL_TOP_K, max_conclusions=RECALL_MAX_CONCLUSIONS, summary=False)
         summaries = session.summaries()
-        summary = summaries.long_summary or summaries.short_summary   # long covers the turns the log no longer has
+        summary = summaries.long_summary or summaries.short_summary
         parts: List[str] = [f"- {c}" for c in ctx.peer_card or []]
         if summary is not None and summary.content:
             parts.append("Earlier in this chat: " + summary.content.strip()[:RECALL_SUMMARY_CHARS])
