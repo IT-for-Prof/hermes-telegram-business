@@ -1328,8 +1328,11 @@ def test_contact_memory_against_a_fake_honcho():
             assert len(msgs) <= 100
             self.batches.append(len(msgs)); self.msgs += msgs
         def context(self, **kw):
-            return SimpleNamespace(peer_card=["works at X"], peer_representation="likes tea",
-                                   summary=SimpleNamespace(content="talked about SIM cards"))
+            assert kw["summary"] is False and kw["max_conclusions"] and kw["search_top_k"]
+            return SimpleNamespace(peer_card=["works at X"], peer_representation="likes tea " * 1000, summary=None)
+        def summaries(self):
+            return SimpleNamespace(short_summary=SimpleNamespace(content="recent"),
+                                   long_summary=SimpleNamespace(content="talked about SIM cards"))
         def delete(self): self.deleted = True
 
     class Conclusions:
@@ -1349,7 +1352,9 @@ def test_contact_memory_against_a_fake_honcho():
 
     honcho = FakeHoncho()
     mem = ContactMemory(honcho, lambda **kw: kw)
-    assert "likes tea" in mem.recall("c1", "200", "q")            # cold recall: no peers added, nothing seeded
+    notes = mem.recall("c1", "200", "q")                          # cold recall: no peers added, nothing seeded
+    assert notes.startswith("- works at X\nEarlier in this chat: talked about SIM cards\nlikes tea")
+    assert len(notes) == 4000                                      # the summary survives a huge representation
     contact = mem.contact_peer("c1", "200")
     history = [(False, f"m{i}") for i in range(150)]
     mem.remember("c1", "200", False, "m149", history)

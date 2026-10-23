@@ -19,6 +19,10 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, List, Optional, Tuple
 
 OWNER_PEER = "tgbiz_owner"
+RECALL_TOP_K = 10               # conclusions semantically closest to the new message
+RECALL_MAX_CONCLUSIONS = 20
+RECALL_SUMMARY_CHARS = 1500     # a long summary reaches 13k chars; keep room for the conclusions
+RECALL_CHARS = 4000
 
 
 def _safe_id(raw: str) -> str:
@@ -74,18 +78,22 @@ class ContactMemory:
         self._add(session, conn_id, chat_id, [(is_owner, text)])
 
     def recall(self, conn_id: str, chat_id: str, query: str) -> str:
-        """What Honcho derived about this contact: peer card, relevant conclusions, chat summary. No LLM call."""
-        ctx = self._honcho.session(self._sid(conn_id, chat_id)).context(
-            peer_target=self.contact_peer(conn_id, chat_id), search_query=query[:500] or None,
-            tokens=800, summary=True)
-        parts: List[str] = []
-        if ctx.peer_card:
-            parts += [f"- {c}" for c in ctx.peer_card]
+        """What Honcho derived about this contact: peer card, chat summary, relevant conclusions. No LLM call.
+
+        The summary comes from its own call: inside ``context()`` the representation takes the whole token
+        budget, so the summary never came back there.
+        """
+        session = self._honcho.session(self._sid(conn_id, chat_id))
+        ctx = session.context(peer_target=self.contact_peer(conn_id, chat_id), search_query=query[:500] or None,
+                              search_top_k=RECALL_TOP_K, max_conclusions=RECALL_MAX_CONCLUSIONS, summary=False)
+        summaries = session.summaries()
+        summary = summaries.long_summary or summaries.short_summary   # long covers the turns the log no longer has
+        parts: List[str] = [f"- {c}" for c in ctx.peer_card or []]
+        if summary is not None and summary.content:
+            parts.append("Earlier in this chat: " + summary.content.strip()[:RECALL_SUMMARY_CHARS])
         if ctx.peer_representation:
             parts.append(ctx.peer_representation.strip())
-        if ctx.summary is not None and getattr(ctx.summary, "content", ""):
-            parts.append("Earlier in this chat: " + ctx.summary.content.strip())
-        return "\n".join(parts)[:3000]
+        return "\n".join(parts)[:RECALL_CHARS]
 
     def forget(self, conn_id: str, chat_ids: Iterable[str]) -> None:
         """Delete each chat's session, every conclusion about the contact, and the contact's card."""
