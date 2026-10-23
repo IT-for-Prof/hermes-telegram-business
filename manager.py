@@ -818,9 +818,7 @@ class BusinessModeManager:
         owner_chat = str(conn["owner_chat_id"])
         name = self._contact_name(conn, customer_chat_id)
         log = self._db.get_business_chat_log(conn_id, customer_chat_id)
-        prompt = (_render_conversation(log, name, self._style_examples(conn, customer_chat_id))
-                  + "\n\nThe owner's gist of his reply, in his own words (it may be terse or transcribed from "
-                  f"voice): {' '.join(gist.split())}\nWrite his reply from this gist.")
+        prompt = gist_prompt(log, name, self._style_examples(conn, customer_chat_id), gist)
         try:
             replies, _ = postprocess_variants(
                 await self._draft_generator(prompt, customer_chat_id, rules=GIST_OUTPUT_RULES))
@@ -1251,6 +1249,13 @@ def _render_conversation(log: List[Dict[str, Any]], customer_name: str,
         + "\n".join(reversed(turns)) + "\n\n"
         f"Draft the owner's reply to the latest message(s) from {one_line(customer_name)}."
     )
+
+
+def gist_prompt(log: List[Dict[str, Any]], customer_name: str, examples: List[Dict[str, Any]], gist: str) -> str:
+    """The prompt that words the owner's gist (eval_persona.py reads the same function)."""
+    return (_render_conversation(log, customer_name, examples)
+            + "\n\nThe owner's gist of his reply, in his own words (it may be terse or transcribed from "
+            f"voice): {' '.join(gist.split())}\nWrite his reply from this gist.")
 
 
 def _customer_display_name(message: Any) -> str:
