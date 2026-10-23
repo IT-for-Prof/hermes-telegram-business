@@ -14,20 +14,22 @@ User flow (the simplest path that works end-to-end):
 
   2. Customer messages the owner in a chat covered by the connection.
      → bot debounces ``debounce_seconds`` (default 8s) to coalesce
-     typing bursts, then drafts a single reply using the most-recent
-     customer text.
-     → bot DMs the draft to the *owner's* chat with this bot, with
-     inline buttons: [✓ Send]  [✎ Edit]  [✕ Discard].
+     typing bursts, then drafts 2-3 replies (one decision each) in one
+     model call.
+     → bot DMs the card to the *owner's* chat with this bot, with
+     inline buttons: [1] [2] [3], then [✍ Своя суть] [✎ Edit] [✕ Discard].
 
   3. Owner taps:
-       Send    → bot sends the draft to the customer chat using
+       1/2/3   → bot sends that reply to the customer chat using
                  ``business_connection_id``. Owner gets a "✓ Sent" confirmation.
+       Своя суть → the owner's next text or voice note is his gist; the bot
+                 words it as his reply and shows it with Send / Edit / Discard.
        Edit    → bot replies "send me the text you want delivered" and
                  captures the owner's next text DM as the outgoing reply.
        Discard → draft dropped, nothing goes to the customer.
 
 The owner is always in control: ``can_reply`` from Telegram is required
-for the Send button to appear, ``/biz pause`` globally suspends drafting,
+for the number buttons to appear, ``/biz pause`` globally suspends drafting,
 and per-chat pauses live in ``business_connections.paused_chats``.
 
 State lives in SQLite tables in the plugin's own database file
@@ -81,8 +83,9 @@ ONBOARDING_MESSAGE = (
     "Here's how it works:\n"
     "• When someone messages you in a chat I have access to, I'll draft "
     "a reply and send it to you here.\n"
-    "• You'll see [✓ Send] [✎ Edit] [✕ Discard] buttons. Nothing goes "
-    "to your contact until you tap Send.\n"
+    "• You'll see 2-3 numbered replies: tap 1, 2 or 3 to send one. Nothing goes "
+    "to your contact until you tap.\n"
+    "• Tap ✍ Своя суть and type or say the gist; I'll word it as your reply.\n"
     "• Tap Edit to override the draft with your own wording.\n"
     "• Tap Discard to drop the draft entirely.\n\n"
     "Useful commands:\n"

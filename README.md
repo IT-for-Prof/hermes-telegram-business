@@ -2,7 +2,7 @@
 
 **Observe-with-approval Telegram Business Mode (secretary bot) for [Hermes Agent](https://github.com/NousResearch/hermes-agent).**
 
-Connect your Telegram Business account to your Hermes bot and it becomes your secretary: every incoming customer message gets an LLM-drafted reply delivered to **your** DM with inline buttons — **nothing reaches the customer until you tap Send.**
+Connect your Telegram Business account to your Hermes bot and it becomes your secretary: every incoming customer message gets 2–3 LLM-drafted replies, each a different decision, delivered to **your** DM with inline buttons — **nothing reaches the customer until you tap one.**
 
 ```
 Customer → your Business account (via Business Mode)
@@ -11,22 +11,31 @@ Bot → your DM
        💬 Carol wrote:
          > Hey, are you free Friday afternoon?
 
-       📝 Suggested reply:
-       Friday afternoon works — anywhere between 2 and 5pm?
+       📝 Suggested replies:
+       1. Friday works, what time suits you?
 
-       [✓ Send]   [✎ Edit]   [✕ Discard]
+       2. Friday is busy, how about Monday?
+
+       3. Which Friday do you mean, this week?
+
+       [1] [2] [3]
+       [✍ Своя суть]  [✎ Edit]  [✕ Discard]
             ↓
-Send    → delivered to the customer via your Business connection
-Edit    → your next DM text becomes the outgoing message
-Discard → dropped, the customer sees nothing
+1 / 2 / 3   → that reply is delivered via your Business connection
+Своя суть   → say or type the gist ("monday 3pm"); the bot words it as your reply
+              and shows it with Send / Edit / Discard
+Edit        → your next DM text becomes the outgoing message
+Discard     → dropped, the customer sees nothing
 ```
+
+The gist also works without a card: tell the Hermes agent in the bot DM "Carol: monday 3pm" (typed or as a voice note) and it calls the plugin's `secretary_reply` tool, which shows the worded reply the same way, or asks which chat you mean when the name fits several. Outside Telegram's 24-hour reply window the reply is shown for copying instead of with Send.
 
 ## Safety properties
 
 - **No auto-send exists.** Every reply requires an owner button tap, even when `can_reply` is granted.
 - **Owner-only buttons.** Callbacks are authorized against the connection's `owner_user_id`; anyone else gets `⛔`.
 - **Drafts expire after 24h** (configurable). Stale buttons no-op.
-- **Without `can_reply`, the Send button is hidden** — you're told to copy/paste manually instead of getting a button that silently fails.
+- **Without `can_reply`, the number buttons are hidden** — you're told to copy/paste manually instead of getting a button that silently fails.
 - **Typing bursts coalesce** — messages within the debounce window accumulate into one draft (an edit replaces its part), one draft per coherent thought.
 - **Only the other party is drafted.** Telegram delivers both sides of a Business chat: the owner's own messages and the bot's Send/Edit echoes are logged as context but never drafted. When the owner answers by hand, the chat's queued/pending draft is withdrawn so a stale Send can't double-reply. Messages from other bots (`from_user.is_bot`, incl. this bot's own DMs to the owner) are neither logged nor drafted.
 
