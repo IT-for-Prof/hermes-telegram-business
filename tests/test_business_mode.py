@@ -394,8 +394,13 @@ class _SentRecorder:
 
     def __init__(self, *, fail: bool = False):
         self.calls: List[Dict[str, Any]] = []
+        self.markups: List[Dict[str, Any]] = []   # edit_markup calls: a card's buttons removed or put back
+        self.generated: List[Any] = []            # (prompt, output rules) of every model call
         self.fail = fail
         self._next_id = 1000
+
+    async def edit_markup(self, **kwargs):
+        self.markups.append(kwargs)
 
     async def __call__(self, **kwargs):
         self.calls.append(kwargs)
@@ -407,20 +412,25 @@ class _SentRecorder:
 
 
 def _make_manager(db, *, draft_text="Draft reply!", draft_fails=False,
-                  send_recorder=None, debounce=0.0):
+                  send_recorder=None, debounce=0.0, replies=None):
+    """``replies``: model answers returned in order (then ``draft_text``)."""
     from telegram_business_plugin.manager import BusinessModeManager
 
-    async def _draft(customer_text: str, customer_chat_id: str) -> str:
+    sender = send_recorder if send_recorder is not None else _SentRecorder()
+    queue = list(replies or [])
+
+    async def _draft(prompt: str, customer_chat_id: str, rules=None) -> str:
         if draft_fails:
             raise RuntimeError("model boom")
-        return draft_text
+        sender.generated.append((prompt, rules))
+        return queue.pop(0) if queue else draft_text
 
-    sender = send_recorder if send_recorder is not None else _SentRecorder()
     mgr = BusinessModeManager(
         session_db=db,
         send_message=sender,
         draft_generator=_draft,
         debounce_seconds=debounce,
+        edit_markup=sender.edit_markup,
     )
     return mgr, sender
 
@@ -494,7 +504,7 @@ class TestBusinessMessageDraftFlow:
         await mgr.handle_connection_update(_fake_business_connection(can_reply=False))
         sender.calls.clear()
         await mgr.handle_business_message(_fake_business_message())
-        assert _buttons(sender.calls[0]["reply_markup"]) == [["✎ Edit", "✕ Discard"]]
+        assert _buttons(sender.calls[0]["reply_markup"]) == [["✍ Своя суть", "✎ Edit", "✕ Discard"]]
 
     @pytest.mark.asyncio
     async def test_unknown_connection_silently_ignored(self, db):
@@ -589,7 +599,7 @@ class TestDecisionVariants:
         assert "1. Да, скину в пятницу" in card["text"]
         assert "2. Может, в понедельник?" in card["text"]
         assert "3. Какой именно счёт?" in card["text"]
-        assert _buttons(card["reply_markup"]) == [["1", "2", "3"], ["✎ Edit", "✕ Discard"]]
+        assert _buttons(card["reply_markup"]) == [["1", "2", "3"], ["✍ Своя суть", "✎ Edit", "✕ Discard"]]
         row = db.get_pending_telegram_business_drafts_for_owner("100")[0]
         assert db.get_telegram_business_draft(row["draft_id"])["variants"] == [
             "Да, скину в пятницу", "Может, в понедельник?", "Какой именно счёт?"]
@@ -679,6 +689,176 @@ class TestDecisionVariants:
         from telegram_business_plugin.manager import BusinessModeManager
         markup = BusinessModeManager._build_draft_keyboard(2**63 - 1, can_reply=True, variants=3)
         assert all(len(b.callback_data.encode()) <= 64 for row in markup.inline_keyboard for b in row)
+
+
+class TestOwnGist:
+    CARD = "Да, скину в пятницу\n---\nМожет, в понедельник?\n---\nКакой именно счёт?"
+
+    async def _card(self, db, replies=()):
+        mgr, sender = _make_manager(db, replies=[self.CARD, *replies])
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message(text="Скинешь счёт до пятницы?"))
+        card = db.get_pending_telegram_business_drafts_for_owner("100")[0]
+        sender.calls.clear()
+        return mgr, sender, card
+
+    @staticmethod
+    def _preview(db, card_id):
+        rows = [r for r in db.get_pending_telegram_business_drafts_for_owner("100") if r["draft_id"] != card_id]
+        return db.get_telegram_business_draft(rows[0]["draft_id"]) if rows else None
+
+    @pytest.mark.asyncio
+    async def test_card_has_an_own_gist_button(self, db):
+        mgr, sender = _make_manager(db, draft_text="Да\n---\nНет")
+        await mgr.handle_connection_update(_fake_business_connection())
+        sender.calls.clear()
+        await mgr.handle_business_message(_fake_business_message())
+        assert _buttons(sender.calls[0]["reply_markup"])[1] == ["✍ Своя суть", "✎ Edit", "✕ Discard"]
+
+    @pytest.mark.asyncio
+    async def test_typed_gist_becomes_a_preview_that_waits_for_send(self, db):
+        """Covers AE3."""
+        from telegram_business_plugin.manager import GIST_OUTPUT_RULES
+        mgr, sender, card = await self._card(db, replies=["Да, в пятницу скину счёт."])
+        await _tap(mgr, f"bd:gist:{card['draft_id']}")
+        ask = sender.calls[-1]
+        assert ask["chat_id"] == 100 and "Суть для Customer Carol?" in ask["text"]
+        assert _buttons(ask["reply_markup"]) == [["Отмена"]]
+        assert await mgr.maybe_handle_edit_capture(owner_chat_id="100", text="да, в пятницу, счёт скину") is True
+        prompt, rules = sender.generated[-1]
+        assert rules == GIST_OUTPUT_RULES
+        assert "да, в пятницу, счёт скину" in prompt and "Скинешь счёт до пятницы?" in prompt
+        preview = sender.calls[-1]
+        assert preview["chat_id"] == 100 and "Да, в пятницу скину счёт." in preview["text"]
+        assert "да, в пятницу, счёт скину" in preview["text"]   # the gist it was built from
+        assert _buttons(preview["reply_markup"]) == [["✓ Send", "✎ Edit", "✕ Discard"]]
+        assert not [c for c in sender.calls if c.get("chat_id") == 200]
+        gist = self._preview(db, card["draft_id"])
+        assert (gist["origin"], gist["gist"], gist["card_id"]) == ("gist_card", "да, в пятницу, счёт скину", card["draft_id"])
+        assert sender.markups[-1] == {"chat_id": 100, "message_id": int(card["owner_message_id"]), "reply_markup": None}
+
+    @pytest.mark.asyncio
+    async def test_sending_the_preview_closes_the_card(self, db):
+        mgr, sender, card = await self._card(db, replies=["Да, в пятницу скину счёт."])
+        await _tap(mgr, f"bd:gist:{card['draft_id']}")
+        await mgr.maybe_handle_edit_capture(owner_chat_id="100", text="да, в пятницу")
+        gist = self._preview(db, card["draft_id"])
+        await _tap(mgr, f"bd:v1:{gist['draft_id']}")
+        assert [c["text"] for c in sender.calls if c.get("chat_id") == 200] == ["Да, в пятницу скину счёт."]
+        assert db.get_telegram_business_draft(gist["draft_id"])["status"] == "sent"
+        assert db.get_telegram_business_draft(card["draft_id"])["status"] == "gisted"
+
+    @pytest.mark.asyncio
+    async def test_discarding_the_preview_gives_the_card_its_buttons_back(self, db):
+        mgr, sender, card = await self._card(db, replies=["Да, в пятницу."])
+        await _tap(mgr, f"bd:gist:{card['draft_id']}")
+        await mgr.maybe_handle_edit_capture(owner_chat_id="100", text="да")
+        gist = self._preview(db, card["draft_id"])
+        await _tap(mgr, f"bd:discard:{gist['draft_id']}")
+        assert db.get_telegram_business_draft(card["draft_id"])["status"] == "pending"
+        restored = sender.markups[-1]
+        assert restored["message_id"] == int(card["owner_message_id"])
+        assert _buttons(restored["reply_markup"])[0] == ["1", "2", "3"]
+
+    @pytest.mark.asyncio
+    async def test_gist_answer_with_separators_still_gives_one_reply(self, db):
+        mgr, sender, card = await self._card(db, replies=["Да, в пятницу.\n---\nИли в понедельник."])
+        await _tap(mgr, f"bd:gist:{card['draft_id']}")
+        await mgr.maybe_handle_edit_capture(owner_chat_id="100", text="да")
+        assert self._preview(db, card["draft_id"])["draft_text"] == "Да, в пятницу."
+
+    @pytest.mark.asyncio
+    async def test_voice_gist_gives_the_same_preview(self, db):
+        """Covers AE5."""
+        mgr, sender, card = await self._card(db, replies=["Да, в пятницу."])
+        await _tap(mgr, f"bd:gist:{card['draft_id']}")
+
+        async def _transcribe():
+            return "да в пятницу"
+
+        assert await mgr.handle_owner_voice(owner_chat_id="100", transcribe=_transcribe) is True
+        gist = self._preview(db, card["draft_id"])
+        assert gist["gist"] == "да в пятницу" and gist["draft_text"] == "Да, в пятницу."
+        assert _buttons(sender.calls[-1]["reply_markup"]) == [["✓ Send", "✎ Edit", "✕ Discard"]]
+
+    @pytest.mark.asyncio
+    async def test_voice_without_a_waiting_gist_is_left_to_hermes(self, db):
+        mgr, sender, card = await self._card(db)
+        heard = []
+
+        async def _transcribe():
+            heard.append(1)
+            return "x"
+
+        assert await mgr.handle_owner_voice(owner_chat_id="100", transcribe=_transcribe) is False
+        assert heard == []
+
+    @pytest.mark.asyncio
+    async def test_failed_transcription_tells_the_owner_and_keeps_waiting(self, db):
+        mgr, sender, card = await self._card(db, replies=["Да."])
+        await _tap(mgr, f"bd:gist:{card['draft_id']}")
+
+        async def _broken():
+            raise RuntimeError("whisper down")
+
+        assert await mgr.handle_owner_voice(owner_chat_id="100", transcribe=_broken) is True
+        assert "whisper down" in sender.calls[-1]["text"]
+        assert await mgr.maybe_handle_edit_capture(owner_chat_id="100", text="да") is True
+        assert self._preview(db, card["draft_id"])["gist"] == "да"
+
+    @pytest.mark.asyncio
+    async def test_cancel_gives_the_next_message_back_to_hermes(self, db):
+        mgr, sender, card = await self._card(db)
+        await _tap(mgr, f"bd:gist:{card['draft_id']}")
+        await _tap(mgr, "bd:cancel:0")
+        assert await mgr.maybe_handle_edit_capture(owner_chat_id="100", text="what's the weather?") is False
+
+    @pytest.mark.asyncio
+    async def test_cancel_from_someone_else_keeps_the_capture(self, db):
+        mgr, sender, card = await self._card(db, replies=["Да."])
+        await _tap(mgr, f"bd:gist:{card['draft_id']}")
+        await _tap(mgr, "bd:cancel:0", caller="9999")
+        assert await mgr.maybe_handle_edit_capture(owner_chat_id="100", text="да") is True
+
+    @pytest.mark.asyncio
+    async def test_outside_the_24_hour_window_the_reply_is_shown_for_copying(self, db):
+        mgr, sender, card = await self._card(db, replies=["Да, в пятницу & не позже."])
+        db._conn.execute("UPDATE business_chat_log SET created_at = created_at - 25 * 3600")
+        db._conn.commit()
+        await _tap(mgr, f"bd:gist:{card['draft_id']}")
+        await mgr.maybe_handle_edit_capture(owner_chat_id="100", text="да")
+        shown = sender.calls[-1]
+        assert shown.get("reply_markup") is None
+        assert shown["parse_mode"] == "HTML" and "<code>Да, в пятницу &amp; не позже.</code>" in shown["text"]
+        rows = [r for r in db._conn.execute("SELECT status, origin FROM business_drafts WHERE origin IS NOT NULL")]
+        assert [tuple(r) for r in rows] == [("copy", "gist_card")]
+        assert db.get_telegram_business_draft(card["draft_id"])["status"] == "pending"
+        assert not sender.markups   # the card keeps its buttons: nothing waits for Send
+
+    @pytest.mark.asyncio
+    async def test_edit_after_the_gist_tap_wins(self, db):
+        mgr, sender, card = await self._card(db)
+        await _tap(mgr, f"bd:gist:{card['draft_id']}")
+        await _tap(mgr, f"bd:edit:{card['draft_id']}")
+        await mgr.maybe_handle_edit_capture(owner_chat_id="100", text="my own words")
+        assert [c["text"] for c in sender.calls if c.get("chat_id") == 200] == ["my own words"]
+        assert db.get_telegram_business_draft(card["draft_id"])["status"] == "edited"
+
+    @pytest.mark.asyncio
+    async def test_gist_tap_after_edit_wins(self, db):
+        mgr, sender, card = await self._card(db, replies=["Да."])
+        await _tap(mgr, f"bd:edit:{card['draft_id']}")
+        await _tap(mgr, f"bd:gist:{card['draft_id']}")
+        await mgr.maybe_handle_edit_capture(owner_chat_id="100", text="да")
+        assert not [c for c in sender.calls if c.get("chat_id") == 200]
+        assert self._preview(db, card["draft_id"])["gist"] == "да"
+
+    @pytest.mark.asyncio
+    async def test_hand_reply_in_the_chat_ends_the_waiting_gist(self, db):
+        mgr, sender, card = await self._card(db)
+        await _tap(mgr, f"bd:gist:{card['draft_id']}")
+        await mgr.handle_business_message(_owner_msg("ответил сам"))
+        assert await mgr.maybe_handle_edit_capture(owner_chat_id="100", text="hello agent") is False
 
 
 class TestCallbackDispatch:

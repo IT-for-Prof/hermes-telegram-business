@@ -45,6 +45,7 @@ sending.
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import re
 import string
@@ -65,7 +66,10 @@ CHOICE_SEND = "send"
 CHOICE_VARIANT = "v"
 CHOICE_EDIT = "edit"
 CHOICE_DISCARD = "discard"
+CHOICE_GIST = "gist"      # "✍ Своя суть": the owner's next text or voice note becomes a reply preview
+CHOICE_CANCEL = "cancel"  # drops a waiting gist; its draft id slot is unused (0)
 MAX_VARIANTS = 3
+REPLY_WINDOW_S = 24 * 3600  # Telegram lets a Business bot reply only within a day of the contact's last message
 
 
 # Onboarding text the bot DMs the owner the first time a BusinessConnection
@@ -127,6 +131,7 @@ class BusinessModeManager:
         max_customer_text_chars: int = 4000,
         persona_source: str = "",
         memory: Any = None,
+        edit_markup: Optional[Callable[..., Awaitable[Any]]] = None,
     ) -> None:
         self._persona_source = persona_source  # shown in /biz status
         self._memory = memory                  # optional ContactMemory (memory.py); None = no Honcho
@@ -148,6 +153,10 @@ class BusinessModeManager:
         # Owner DMs that are in "next message = edited reply" mode.
         # Keyed by owner_chat_id → draft_id awaiting the override text.
         self._edit_capture: Dict[str, int] = {}
+        # Owner DMs waiting for a gist (text or voice): owner_chat_id → conn_id, chat_id, origin, card_id.
+        # One capture of either kind per owner chat; a new tap replaces the old one.
+        self._gist_capture: Dict[str, Dict[str, Any]] = {}
+        self._edit_markup = edit_markup  # (chat_id, message_id, reply_markup): a card's buttons off and on
 
     # ------------------------------------------------------------------
     # BusinessConnection updates (established / edited / ended).
@@ -333,6 +342,9 @@ class BusinessModeManager:
             draft = self._db.get_telegram_business_draft(draft_id)
             if draft and draft["connection_id"] == conn_id and draft["customer_chat_id"] == customer_chat_id:
                 self._edit_capture.pop(owner_chat, None)
+        for owner_chat, cap in list(self._gist_capture.items()):
+            if cap["conn_id"] == conn_id and cap["chat_id"] == customer_chat_id:
+                self._gist_capture.pop(owner_chat, None)
 
     def _cancel_debounce(self, key: str) -> None:
         task = self._debounce_tasks.pop(key, None)
@@ -558,6 +570,8 @@ class BusinessModeManager:
             await answer(text="Invalid draft action.")
             return True
         choice = parts[1]
+        if choice == CHOICE_CANCEL:
+            return await self._cancel_gist(caller_user_id, answer, edit_message_text)
         try:
             draft_id = int(parts[2])
         except ValueError:
@@ -588,6 +602,8 @@ class BusinessModeManager:
 
         if choice == CHOICE_DISCARD:
             self._db.resolve_telegram_business_draft(draft_id, status="discarded")
+            if draft.get("card_id") is not None:
+                await self._restore_card_buttons(draft["card_id"], conn)
             await answer(text="✕ Discarded")
             try:
                 await edit_message_text(
@@ -598,7 +614,17 @@ class BusinessModeManager:
                 pass
             return True
 
+        if choice == CHOICE_GIST:
+            owner_chat = str(conn["owner_chat_id"])
+            self._edit_capture.pop(owner_chat, None)
+            self._gist_capture[owner_chat] = {"conn_id": draft["connection_id"], "chat_id": draft["customer_chat_id"],
+                                              "origin": "gist_card", "card_id": draft_id}
+            await answer(text="✍ Жду суть")
+            await self._ask_for_gist(owner_chat, conn, draft["customer_chat_id"])
+            return True
+
         if choice == CHOICE_EDIT:
+            self._gist_capture.pop(str(conn["owner_chat_id"]), None)
             self._edit_capture[str(conn["owner_chat_id"])] = draft_id
             await answer(text="✎ Send me the text to deliver")
             try:
@@ -672,6 +698,8 @@ class BusinessModeManager:
         """
         draft_id = self._edit_capture.pop(str(owner_chat_id), None)
         if draft_id is None:
+            if str(owner_chat_id) in self._gist_capture:
+                return await self._take_gist(str(owner_chat_id), text)
             return False
 
         override = (text or "").strip()
@@ -748,6 +776,141 @@ class BusinessModeManager:
         except Exception:
             pass
         return True
+
+    # ------------------------------------------------------------------
+    # The owner's gist ("Своя суть"): his decision in a few words or a voice
+    # note, worded into a reply that waits for his Send.
+    # ------------------------------------------------------------------
+
+    async def handle_owner_voice(self, *, owner_chat_id: str, transcribe: Callable[[], Awaitable[str]]) -> bool:
+        """A voice note in the bot DM: a gist when one is awaited, otherwise Hermes's (returns False, untouched)."""
+        if str(owner_chat_id) not in self._gist_capture:
+            return False
+        try:
+            text = await transcribe()
+        except Exception as exc:
+            logger.warning("Business gist transcription failed: %s", exc)
+            await self._notify(owner_chat_id, f"⚠️ Не удалось расшифровать голосовое ({exc}). Напишите суть текстом.")
+            return True
+        return await self._take_gist(str(owner_chat_id), text)
+
+    async def _take_gist(self, owner_chat_id: str, text: str) -> bool:
+        cap = self._gist_capture[owner_chat_id]
+        gist = (text or "").strip()
+        if not gist:
+            await self._notify(owner_chat_id, "✍ Суть пустая. Напишите или скажите её ещё раз.")
+            return True
+        if await self.word_gist(conn_id=cap["conn_id"], customer_chat_id=cap["chat_id"], gist=gist,
+                                origin=cap["origin"], card_id=cap.get("card_id")):
+            self._gist_capture.pop(owner_chat_id, None)
+        return True
+
+    async def word_gist(self, *, conn_id: str, customer_chat_id: str, gist: str, origin: str,
+                        card_id: Optional[int] = None) -> bool:
+        """Word the owner's gist as his reply and show it to him: with Send inside Telegram's reply window,
+        for copying outside it. ``card_id`` defaults to the chat's live card. False when nothing was shown."""
+        conn = self._db.get_telegram_business_connection(conn_id)
+        if not conn:
+            return False
+        owner_chat = str(conn["owner_chat_id"])
+        name = self._contact_name(conn, customer_chat_id)
+        log = self._db.get_business_chat_log(conn_id, customer_chat_id)
+        prompt = (_render_conversation(log, name, self._style_examples(conn, customer_chat_id))
+                  + "\n\nThe owner's gist of his reply, in his own words (it may be terse or transcribed from "
+                  f"voice): {' '.join(gist.split())}\nWrite his reply from this gist.")
+        try:
+            replies, _ = postprocess_variants(
+                await self._draft_generator(prompt, customer_chat_id, rules=GIST_OUTPUT_RULES))
+        except Exception as exc:
+            logger.exception("Business gist wording failed: %s", exc)
+            await self._notify(owner_chat, f"⚠️ Не получилось написать ответ по сути: {exc}. Попробуйте ещё раз.")
+            return False
+        if not replies:
+            await self._notify(owner_chat, "⚠️ Модель вернула пустой ответ. Попробуйте сказать суть иначе.")
+            return False
+        reply = replies[0]
+        card = self._live_card(owner_chat, conn_id, customer_chat_id, card_id)
+        contact_text = next((r["text"] for r in reversed(log) if not r["is_owner"]), "")
+        last = self._db.last_contact_message_at(conn_id, customer_chat_id)
+        can_send = bool(conn.get("can_reply")) and last is not None and time.time() - last < REPLY_WINDOW_S
+        row = dict(connection_id=conn_id, owner_chat_id=owner_chat, customer_chat_id=customer_chat_id,
+                   customer_msg_id=None, customer_text=contact_text, draft_text=reply, origin=origin, gist=gist)
+        if not can_send:
+            self._db.create_telegram_business_draft(**row, status="copy")
+            await self._send(chat_id=int(owner_chat), parse_mode="HTML", disable_notification=False, text=(
+                f"✍ Ответ для {html.escape(name)} по вашей сути. Отправить от вашего имени нельзя: контакт "
+                "не писал больше суток или отправка выключена. Скопируйте и отправьте сами:\n\n"
+                f"<code>{html.escape(reply)}</code>\n\nСуть: {html.escape(gist)}"))
+            return True
+        gist_id = self._db.create_telegram_business_draft(
+            **row, card_id=card["draft_id"] if card else None, ttl_seconds=self._draft_ttl_seconds)
+        if card and card.get("owner_message_id"):
+            await self._set_card_buttons(owner_chat, card["owner_message_id"], None)
+        sent = await self._send(
+            chat_id=int(owner_chat), disable_notification=False, reply_markup=self._build_gist_keyboard(gist_id),
+            text=f"✍ Ответ для {name} по вашей сути:\n{reply}\n\nСуть: {gist}")
+        if getattr(sent, "message_id", None) is not None:
+            self._db.set_telegram_business_draft_owner_message(gist_id, str(sent.message_id))
+        return True
+
+    def _live_card(self, owner_chat: str, conn_id: str, customer_chat_id: str,
+                   card_id: Optional[int]) -> Optional[Dict[str, Any]]:
+        """The chat's pending card (not a gist preview) that this gist would close, if any."""
+        for row in reversed(self._db.get_pending_telegram_business_drafts_for_owner(owner_chat)):
+            if (row["connection_id"] == conn_id and row["customer_chat_id"] == customer_chat_id
+                    and row["origin"] is None and (card_id is None or row["draft_id"] == card_id)):
+                return row
+        return None
+
+    def _contact_name(self, conn: Dict[str, Any], customer_chat_id: str) -> str:
+        found = [c for c in self._db.find_chats(conn["owner_user_id"], customer_chat_id)
+                 if c["connection_id"] == conn["connection_id"]]
+        return found[0]["name"] if found else "контакта"
+
+    async def _ask_for_gist(self, owner_chat: str, conn: Dict[str, Any], customer_chat_id: str) -> None:
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        await self._send(
+            chat_id=int(owner_chat), disable_notification=True,
+            text=f"✍ Суть для {self._contact_name(conn, customer_chat_id)}? Напишите или скажите.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                "Отмена", callback_data=f"{CALLBACK_PREFIX}{CHOICE_CANCEL}:0")]]))
+
+    async def _cancel_gist(self, caller_user_id: Optional[str], answer: Callable[..., Awaitable[Any]],
+                           edit_message_text: Callable[..., Awaitable[Any]]) -> bool:
+        dropped = False
+        for owner_chat, cap in list(self._gist_capture.items()):
+            conn = self._db.get_telegram_business_connection(cap["conn_id"])
+            if conn and str(caller_user_id) == str(conn.get("owner_user_id")):
+                self._gist_capture.pop(owner_chat, None)
+                dropped = True
+        await answer(text="Отменено" if dropped else "Нечего отменять")
+        if dropped:
+            try:
+                await edit_message_text(text="✍ Отменено", reply_markup=None)
+            except Exception:
+                pass
+        return True
+
+    async def _restore_card_buttons(self, card_id: int, conn: Dict[str, Any]) -> None:
+        card = self._db.get_telegram_business_draft(card_id)
+        if card and card["status"] == "pending" and card.get("owner_message_id"):
+            await self._set_card_buttons(str(conn["owner_chat_id"]), card["owner_message_id"],
+                                         self._build_draft_keyboard(card_id, can_reply=bool(conn.get("can_reply")),
+                                                                    variants=len(card["variants"] or [1])))
+
+    async def _set_card_buttons(self, owner_chat: str, message_id: str, markup: Any) -> None:
+        if self._edit_markup is None:
+            return
+        try:
+            await self._edit_markup(chat_id=int(owner_chat), message_id=int(message_id), reply_markup=markup)
+        except Exception as exc:
+            logger.warning("Business card buttons could not be changed: %s", exc)
+
+    async def _notify(self, owner_chat_id: str, text: str) -> None:
+        try:
+            await self._send(chat_id=int(owner_chat_id), text=text, disable_notification=False)
+        except Exception:
+            logger.exception("Business notice to owner %s failed", owner_chat_id)
 
     # ------------------------------------------------------------------
     # /biz slash command (owner-only).
@@ -902,10 +1065,21 @@ class BusinessModeManager:
                 str(n), callback_data=f"{CALLBACK_PREFIX}{CHOICE_VARIANT}{n}:{draft_id}",
             ) for n in range(1, variants + 1)])
         rows.append([
+            InlineKeyboardButton("✍ Своя суть", callback_data=f"{CALLBACK_PREFIX}{CHOICE_GIST}:{draft_id}"),
             InlineKeyboardButton("✎ Edit", callback_data=f"{CALLBACK_PREFIX}{CHOICE_EDIT}:{draft_id}"),
             InlineKeyboardButton("✕ Discard", callback_data=f"{CALLBACK_PREFIX}{CHOICE_DISCARD}:{draft_id}"),
         ])
         return InlineKeyboardMarkup(rows)
+
+    @staticmethod
+    def _build_gist_keyboard(draft_id: int):
+        """Send / Edit / Discard for a gist preview (only shown inside the reply window)."""
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton("✓ Send", callback_data=f"{CALLBACK_PREFIX}{CHOICE_VARIANT}1:{draft_id}"),
+            InlineKeyboardButton("✎ Edit", callback_data=f"{CALLBACK_PREFIX}{CHOICE_EDIT}:{draft_id}"),
+            InlineKeyboardButton("✕ Discard", callback_data=f"{CALLBACK_PREFIX}{CHOICE_DISCARD}:{draft_id}"),
+        ]])
 
 
 # ---------------------------------------------------------------------------
@@ -930,6 +1104,13 @@ DRAFT_OUTPUT_RULES = (
     "are good alternatives. Each reply carries one decision and adds no fact, date, amount or commitment that is "
     "not in the conversation. No numbering, preamble, quotes or markdown. Keep each reply under 4 sentences "
     "unless the customer asked something that genuinely needs a longer reply."
+)
+# The system prompt's rules for a reply worded from the owner's gist (instead of DRAFT_OUTPUT_RULES).
+GIST_OUTPUT_RULES = (
+    "Output one reply: the message the owner will send, written from his gist in his style. Keep every fact, "
+    "date, amount and decision of the gist exactly as he gave it, and add none that is not in the gist or the "
+    "conversation. Output only the message text: no preamble, quotes, markdown, alternatives or ---. Keep it "
+    "under 4 sentences unless the gist itself is longer."
 )
 _VARIANT_SEPARATOR = re.compile(r"^[ \t]*-{3,}[ \t]*$", re.MULTILINE)
 

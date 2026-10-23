@@ -2,15 +2,18 @@
 
 Turns a Hermes Telegram bot into a secretary for a Telegram Business
 account: customers message the owner, the plugin drafts a reply via the
-host LLM, and the OWNER approves every message before it goes out via
-[✓ Send] [✎ Edit] [✕ Discard] inline buttons. There is no auto-send.
+host LLM, and the OWNER approves every message before it goes out: each
+card offers 2-3 numbered replies with buttons 1-3, plus [✍ Своя суть]
+(the owner's gist by text or voice, worded into a reply he then sends),
+[✎ Edit] and [✕ Discard]. There is no auto-send.
 
 Wiring (all through the public Hermes plugin surface — zero core edits):
 
 * ``ctx.register_telegram_handler`` — PTB handlers for BusinessConnection
   updates, business_message / edited_business_message updates, a
-  pattern-scoped ``bd:`` CallbackQueryHandler for the draft buttons, an
-  owner-DM text handler for edit-capture, and a ``/biz`` CommandHandler.
+  pattern-scoped ``bd:`` CallbackQueryHandler for the draft buttons,
+  owner-DM text and voice handlers for Edit and gist capture, and a
+  ``/biz`` CommandHandler.
 * ``ctx.llm`` — host-owned drafting (user's active model + auth).
 * Plugin-owned SQLite state at ``<HERMES_HOME>/telegram-business/state.db``.
 
@@ -24,11 +27,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
 try:  # Normal package import (Hermes plugin loader, tests via conftest alias)
-    from .manager import BusinessModeManager, CALLBACK_PREFIX, DRAFT_OUTPUT_RULES
+    from .manager import BusinessModeManager, CALLBACK_PREFIX, DRAFT_OUTPUT_RULES, GIST_OUTPUT_RULES
     from .state import BusinessStateDB
     from .memory import load as load_contact_memory
 except ImportError:  # pragma: no cover - loaded as a bare module (no package)
@@ -48,6 +52,7 @@ except ImportError:  # pragma: no cover - loaded as a bare module (no package)
     BusinessModeManager = _manager_mod.BusinessModeManager
     CALLBACK_PREFIX = _manager_mod.CALLBACK_PREFIX
     DRAFT_OUTPUT_RULES = _manager_mod.DRAFT_OUTPUT_RULES
+    GIST_OUTPUT_RULES = _manager_mod.GIST_OUTPUT_RULES
     BusinessStateDB = _state_mod.BusinessStateDB
     load_contact_memory = _load("memory").load
 
@@ -77,6 +82,10 @@ _BOT_POLL_SECONDS = 1.0
 async def _send_via(state: dict, **kwargs):
     kwargs.setdefault("parse_mode", None)
     kwargs.setdefault("disable_web_page_preview", True)
+    return await _bot_call(state, "send_message", **kwargs)
+
+
+async def _bot_call(state: dict, method: str, **kwargs):
     loop = asyncio.get_running_loop()
     deadline = loop.time() + _BOT_WAIT_SECONDS
     while True:
@@ -84,10 +93,24 @@ async def _send_via(state: dict, **kwargs):
         bot = getattr(adapter, "_bot", None)
         # A rebuilt adapter gets its bot before it finishes connecting; wait for is_connected too.
         if bot is not None and getattr(adapter, "is_connected", True):
-            return await bot.send_message(**kwargs)
+            return await getattr(bot, method)(**kwargs)
         if loop.time() >= deadline:
             raise RuntimeError("Telegram bot is not connected")
         await asyncio.sleep(_BOT_POLL_SECONDS)
+
+
+async def _transcribe_voice(message: Any) -> str:
+    """The owner's voice note as text, through Hermes's own speech-to-text (local whisper here)."""
+    from tools.transcription_tools import transcribe_audio
+
+    tg_file = await message.voice.get_file()
+    with tempfile.TemporaryDirectory(prefix="tb-gist-") as tmp:
+        path = str(Path(tmp) / "gist.ogg")
+        await tg_file.download_to_drive(path)
+        result = await asyncio.get_running_loop().run_in_executor(None, transcribe_audio, path)
+    if not result.get("success") or not (result.get("transcript") or "").strip():
+        raise RuntimeError(result.get("error") or "empty transcript")
+    return result["transcript"].strip()
 
 
 _CONFIG_KEYS = ("debounce_seconds", "draft_ttl_hours", "max_customer_text_chars", "owner_persona")
@@ -136,16 +159,25 @@ def _plugin_config(ctx: Any) -> dict:
 
 
 DRAFT_TASK = "telegram_business_draft"
+GIST_TASK = "telegram_business_gist"
+
+
+def _task_defaults(tag: str) -> dict:
+    # Reasoning off: Qwen thinks by default and spent ~1.8k output tokens per draft; the replay eval showed the
+    # same style, commas and ё without it (2026-10-23). The tag lets Langfuse sum each task's spend.
+    return {"extra_body": {"reasoning_effort": "none", "metadata": {"generation_name": tag, "tags": [tag]}}}
 
 
 def register(ctx: Any) -> None:
     cfg = _plugin_config(ctx)
-    # Own auxiliary slot so drafts skip the model's hidden reasoning: Qwen thinks by default and spent ~1.8k
-    # output tokens per draft; the replay eval showed the same style, commas and ё without it (2026-10-23).
-    # Turn it back on with auxiliary.telegram_business_draft.extra_body in config.yaml.
+    # Own auxiliary slots (see _task_defaults); reasoning goes back on with
+    # auxiliary.<task>.extra_body in config.yaml.
     ctx.register_auxiliary_task(DRAFT_TASK, display_name="Telegram Business drafts",
                                 description="Reply drafts for Telegram Business chats",
-                                defaults={"extra_body": {"reasoning_effort": "none"}})
+                                defaults=_task_defaults("telegram-business-draft"))
+    ctx.register_auxiliary_task(GIST_TASK, display_name="Telegram Business gist replies",
+                                description="The owner's gist worded into his reply",
+                                defaults=_task_defaults("telegram-business-gist"))
     debounce = float(cfg.get("debounce_seconds", 8.0))
     ttl_hours = float(cfg.get("draft_ttl_hours", 24.0))
     max_chars = int(cfg.get("max_customer_text_chars", 4000))
@@ -173,13 +205,12 @@ def register(ctx: Any) -> None:
         async def _send(**kwargs):
             return await _send_via(_state, **kwargs)
 
-        system_prompt = f"{persona}\n\n{DRAFT_OUTPUT_RULES}"
-
-        async def _draft(prompt_text: str, customer_chat_id: str) -> str:
+        async def _draft(prompt_text: str, customer_chat_id: str, rules: str = DRAFT_OUTPUT_RULES) -> str:
             messages = [
-                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": f"{persona}\n\n{rules}"},
                 {"role": "user", "content": prompt_text},
             ]
+            task = GIST_TASK if rules == GIST_OUTPUT_RULES else DRAFT_TASK
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(
                 None,
@@ -188,7 +219,7 @@ def register(ctx: Any) -> None:
                     max_tokens=500,
                     timeout=60.0,
                     purpose="telegram-business draft",
-                    task=DRAFT_TASK,
+                    task=task,
                 ),
             )
             return (result.text or "").strip()
@@ -202,6 +233,7 @@ def register(ctx: Any) -> None:
             max_customer_text_chars=max_chars,
             persona_source=persona_source,
             memory=memory,
+            edit_markup=lambda **kw: _bot_call(_state, "edit_message_reply_markup", **kw),
         )
         return _state["manager"]
 
@@ -288,6 +320,23 @@ def register(ctx: Any) -> None:
             if consumed:
                 raise ApplicationHandlerStop
 
+        async def _on_owner_voice(update, context):
+            """A voice note in the bot DM: the awaited gist (then Hermes never sees it), else left to Hermes."""
+            from telegram.ext import ApplicationHandlerStop
+
+            message = getattr(update, "message", None)
+            chat = getattr(message, "chat", None)
+            if message is None or chat is None:
+                return
+            try:
+                consumed = await manager.handle_owner_voice(
+                    owner_chat_id=str(chat.id), transcribe=lambda: _transcribe_voice(message))
+            except Exception as exc:
+                logger.exception("telegram-business: voice gist failed: %s", exc)
+                consumed = False
+            if consumed:
+                raise ApplicationHandlerStop
+
         async def _on_biz_command(update, context):
             message = getattr(update, "message", None)
             if message is None:
@@ -336,6 +385,10 @@ def register(ctx: Any) -> None:
         application.add_handler(MessageHandler(
             filters.TEXT & ~filters.COMMAND & filters.ChatType.PRIVATE,
             _on_owner_dm,
+        ), group=-1)
+        application.add_handler(MessageHandler(
+            filters.VOICE & filters.ChatType.PRIVATE,
+            _on_owner_voice,
         ), group=-1)
 
         logger.info("telegram-business: Business Mode handlers wired")

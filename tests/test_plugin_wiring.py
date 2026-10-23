@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
 import telegram_business_plugin as plugin
 
 
@@ -28,10 +30,106 @@ def test_register_queues_one_factory():
     assert len(ctx.factories) == 1
 
 
-def test_drafts_use_own_task_without_reasoning():
+def test_drafts_and_gists_use_own_tasks_without_reasoning_and_with_a_cost_tag():
     ctx = _FakeCtx()
     plugin.register(ctx)
-    assert ctx.aux_tasks[plugin.DRAFT_TASK]["defaults"] == {"extra_body": {"reasoning_effort": "none"}}
+    for task, tag in ((plugin.DRAFT_TASK, "telegram-business-draft"), (plugin.GIST_TASK, "telegram-business-gist")):
+        assert ctx.aux_tasks[task]["defaults"] == {"extra_body": {
+            "reasoning_effort": "none", "metadata": {"generation_name": tag, "tags": [tag]}}}
+
+
+def _wired(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ctx = _FakeCtx()
+    plugin.register(ctx)
+    application = MagicMock()
+    ctx.factories[0](application, SimpleNamespace(_bot=MagicMock(), name="telegram"))
+    return ctx, application
+
+
+def _handler(application, callback_name):
+    """The callback registered under that name in the latest wiring, and how many handlers sit in group -1."""
+    from telegram.ext import MessageHandler
+    callbacks = [c.args[-1] for c in MessageHandler.call_args_list if getattr(c.args[-1], "__name__", "") == callback_name]
+    assert callbacks, callback_name
+    early = sum(kw.get("group") == -1 for _, kw in application.add_handler.call_args_list)
+    return callbacks[-1], early
+
+
+def _manager(application):
+    import inspect
+    return inspect.getclosurevars(_handler(application, "_on_owner_voice")[0]).nonlocals["manager"]
+
+
+@pytest.mark.asyncio
+async def test_gist_wording_uses_the_gist_task_and_rules(tmp_path, monkeypatch):
+    from telegram_business_plugin.manager import GIST_OUTPUT_RULES
+    ctx, application = _wired(tmp_path, monkeypatch)
+    ctx.llm.complete.return_value = SimpleNamespace(text="Да, в пятницу.")
+    gen = _manager(application)._draft_generator
+    assert await gen("prompt", "200", rules=GIST_OUTPUT_RULES) == "Да, в пятницу."
+    messages = ctx.llm.complete.call_args.args[0]
+    assert ctx.llm.complete.call_args.kwargs["task"] == plugin.GIST_TASK
+    assert messages[0]["content"].endswith(GIST_OUTPUT_RULES)
+    await gen("prompt", "200")
+    assert ctx.llm.complete.call_args.kwargs["task"] == plugin.DRAFT_TASK
+
+
+@pytest.mark.asyncio
+async def test_voice_note_is_transcribed_only_while_a_gist_waits(tmp_path, monkeypatch):
+    import sys
+    import types
+
+    from telegram.ext import ApplicationHandlerStop
+    heard = []
+    stt = types.ModuleType("tools.transcription_tools")
+    stt.transcribe_audio = lambda path: heard.append(path) or {"success": True, "transcript": "да в пятницу"}
+    monkeypatch.setitem(sys.modules, "tools.transcription_tools", stt)
+    ctx, application = _wired(tmp_path, monkeypatch)
+    on_voice, early = _handler(application, "_on_owner_voice")
+    assert early == 2  # text and voice capture both run before Hermes's own handlers
+    downloads = []
+
+    async def _download(path):
+        downloads.append(path)
+        Path(path).write_bytes(b"ogg")
+
+    tg_file = SimpleNamespace(download_to_drive=_download)
+
+    async def _get_file():
+        return tg_file
+
+    update = SimpleNamespace(message=SimpleNamespace(chat=SimpleNamespace(id=100), voice=SimpleNamespace(get_file=_get_file)))
+    await on_voice(update, None)  # nothing waits: left to Hermes, nothing downloaded
+    assert downloads == [] and heard == []
+
+    manager = _manager(application)
+    taken = []
+
+    async def _take(owner_chat_id, text):
+        taken.append((owner_chat_id, text))
+        return True
+
+    manager._gist_capture["100"] = {"conn_id": "c", "chat_id": "200", "origin": "gist_card", "card_id": None}
+    monkeypatch.setattr(manager, "_take_gist", _take)
+    with pytest.raises(ApplicationHandlerStop):
+        await on_voice(update, None)
+    assert taken == [("100", "да в пятницу")] and heard == downloads
+    assert not Path(downloads[0]).exists()  # the downloaded clip is removed
+
+
+@pytest.mark.asyncio
+async def test_failed_transcription_reaches_the_owner(tmp_path, monkeypatch):
+    import sys
+    import types
+    stt = types.ModuleType("tools.transcription_tools")
+    stt.transcribe_audio = lambda path: {"success": False, "error": "no backend"}
+    monkeypatch.setitem(sys.modules, "tools.transcription_tools", stt)
+    ctx, application = _wired(tmp_path, monkeypatch)
+    with pytest.raises(RuntimeError, match="no backend"):
+        await plugin._transcribe_voice(SimpleNamespace(voice=SimpleNamespace(
+            get_file=lambda: asyncio.sleep(0, result=SimpleNamespace(
+                download_to_drive=lambda path: asyncio.sleep(0, result=Path(path).write_bytes(b"x")))))))
 
 
 def test_factory_wires_handlers(tmp_path, monkeypatch):
@@ -45,9 +143,9 @@ def test_factory_wires_handlers(tmp_path, monkeypatch):
 
     factory(application, adapter)
 
-    # 6 handlers: BusinessConnection, 2x business message, bd: callback,
-    # /biz command, owner-DM edit capture.
-    assert application.add_handler.call_count == 6
+    # 7 handlers: BusinessConnection, 2x business message, bd: callback,
+    # /biz command, owner-DM edit/gist capture, owner-DM voice gist.
+    assert application.add_handler.call_count == 7
 
     # The edit-capture handler must be registered in group -1 so it runs
     # before (and can yield to) the core adapter's text handler.
