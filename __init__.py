@@ -135,8 +135,17 @@ def _plugin_config(ctx: Any) -> dict:
     return cfg
 
 
+DRAFT_TASK = "telegram_business_draft"
+
+
 def register(ctx: Any) -> None:
     cfg = _plugin_config(ctx)
+    # Own auxiliary slot so drafts skip the model's hidden reasoning: Qwen thinks by default and spent ~1.8k
+    # output tokens per draft; the replay eval showed the same style, commas and ё without it (2026-10-23).
+    # Turn it back on with auxiliary.telegram_business_draft.extra_body in config.yaml.
+    ctx.register_auxiliary_task(DRAFT_TASK, display_name="Telegram Business drafts",
+                                description="Reply drafts for Telegram Business chats",
+                                defaults={"extra_body": {"reasoning_effort": "none"}})
     debounce = float(cfg.get("debounce_seconds", 8.0))
     ttl_hours = float(cfg.get("draft_ttl_hours", 24.0))
     max_chars = int(cfg.get("max_customer_text_chars", 4000))
@@ -179,6 +188,7 @@ def register(ctx: Any) -> None:
                     max_tokens=500,
                     timeout=60.0,
                     purpose="telegram-business draft",
+                    task=DRAFT_TASK,
                 ),
             )
             return (result.text or "").strip()

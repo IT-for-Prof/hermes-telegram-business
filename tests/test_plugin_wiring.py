@@ -12,6 +12,10 @@ class _FakeCtx:
     def __init__(self):
         self.factories = []
         self.llm = MagicMock()
+        self.aux_tasks = {}
+
+    def register_auxiliary_task(self, key, **kwargs):
+        self.aux_tasks[key] = kwargs
 
     def register_telegram_handler(self, factory):
         assert callable(factory)
@@ -22,6 +26,12 @@ def test_register_queues_one_factory():
     ctx = _FakeCtx()
     plugin.register(ctx)
     assert len(ctx.factories) == 1
+
+
+def test_drafts_use_own_task_without_reasoning():
+    ctx = _FakeCtx()
+    plugin.register(ctx)
+    assert ctx.aux_tasks[plugin.DRAFT_TASK]["defaults"] == {"extra_body": {"reasoning_effort": "none"}}
 
 
 def test_factory_wires_handlers(tmp_path, monkeypatch):
