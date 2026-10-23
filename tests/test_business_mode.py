@@ -861,6 +861,45 @@ class TestOwnGist:
         assert await mgr.maybe_handle_edit_capture(owner_chat_id="100", text="hello agent") is False
 
 
+class TestGistFromTheBotDm:
+    @staticmethod
+    async def _chats(db, replies=()):
+        mgr, sender = _make_manager(db, replies=list(replies))
+        await mgr.handle_connection_update(_fake_business_connection())
+        db.set_telegram_business_auto_draft("conn1", auto_draft=False)
+        for chat, name in ((201, "Ivan Petrov"), (202, "Ivan Sidorov"), (203, "Carol")):
+            msg = _fake_business_message(customer_chat_id=chat, text="привет", msg_id=chat)
+            msg.from_user.full_name = name
+            await mgr.handle_business_message(msg)
+        sender.calls.clear()
+        return mgr, sender
+
+    @pytest.mark.asyncio
+    async def test_two_matching_names_are_listed_and_nothing_is_written(self, db):
+        """Covers AE4."""
+        mgr, sender = await self._chats(db)
+        result = await mgr.reply_from_dm(contact="Иван", gist="да, в пятницу")
+        assert result["status"] == "no_match"
+        result = await mgr.reply_from_dm(contact="Ivan", gist="да, в пятницу")
+        assert result == {"status": "ambiguous", "candidates": ["Ivan Petrov (chat 201)", "Ivan Sidorov (chat 202)"]}
+        assert sender.calls == [] and sender.generated == []
+        assert db.get_pending_telegram_business_drafts_for_owner("100") == []
+
+    @pytest.mark.asyncio
+    async def test_one_match_shows_a_gist_dm_preview(self, db):
+        mgr, sender = await self._chats(db, replies=["Да, в пятницу."])
+        result = await mgr.reply_from_dm(contact="carol", gist="да, в пятницу")
+        assert result == {"status": "shown", "contact": "Carol"}
+        rows = db.get_pending_telegram_business_drafts_for_owner("100")
+        assert [(r["customer_chat_id"], r["origin"], r["gist"]) for r in rows] == [("203", "gist_dm", "да, в пятницу")]
+        assert sender.calls[-1]["chat_id"] == 100 and "Да, в пятницу." in sender.calls[-1]["text"]
+
+    @pytest.mark.asyncio
+    async def test_a_chat_id_picks_the_chat(self, db):
+        mgr, sender = await self._chats(db, replies=["Да."])
+        assert (await mgr.reply_from_dm(contact="202", gist="да"))["contact"] == "Ivan Sidorov"
+
+
 class TestCallbackDispatch:
     @pytest.mark.asyncio
     async def test_send_button_delivers_to_customer_chat(self, db):

@@ -853,6 +853,21 @@ class BusinessModeManager:
             self._db.set_telegram_business_draft_owner_message(gist_id, str(sent.message_id))
         return True
 
+    async def reply_from_dm(self, *, contact: str, gist: str) -> Dict[str, Any]:
+        """The bot-DM path (Hermes agent's ``secretary_reply`` tool): find the one chat ``contact`` names and show
+        the gist reply there, or list the candidates so the agent asks the owner which chat he means."""
+        owners = {c["owner_user_id"] for c in self._db.list_telegram_business_connections(enabled_only=True)}
+        found = [c for owner in sorted(owners) for c in self._db.find_chats(owner, contact)]
+        if not found:
+            return {"status": "no_match"}
+        if len(found) > 1:
+            return {"status": "ambiguous",
+                    "candidates": sorted(f"{c['name']} (chat {c['customer_chat_id']})" for c in found)}
+        chat = found[0]
+        shown = await self.word_gist(conn_id=chat["connection_id"], customer_chat_id=chat["customer_chat_id"],
+                                     gist=gist.strip(), origin="gist_dm")
+        return {"status": "shown", "contact": chat["name"]} if shown else {"status": "failed"}
+
     def _live_card(self, owner_chat: str, conn_id: str, customer_chat_id: str,
                    card_id: Optional[int]) -> Optional[Dict[str, Any]]:
         """The chat's pending card (not a gist preview) that this gist would close, if any."""

@@ -14,6 +14,8 @@ Wiring (all through the public Hermes plugin surface — zero core edits):
   pattern-scoped ``bd:`` CallbackQueryHandler for the draft buttons,
   owner-DM text and voice handlers for Edit and gist capture, and a
   ``/biz`` CommandHandler.
+* ``ctx.register_tool`` — ``secretary_reply``: the Hermes agent hands over the
+  owner's gist from the bot DM ("Ивану: да, в пятницу", typed or spoken).
 * ``ctx.llm`` — host-owned drafting (user's active model + auth).
 * Plugin-owned SQLite state at ``<HERMES_HOME>/telegram-business/state.db``.
 
@@ -25,6 +27,7 @@ Telegram platform plugin).
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import tempfile
@@ -162,6 +165,28 @@ DRAFT_TASK = "telegram_business_draft"
 GIST_TASK = "telegram_business_gist"
 
 
+SECRETARY_TOOL_SCHEMA = {
+    "name": "secretary_reply",
+    "description": (
+        "Prepare a reply to one of the owner's Telegram Business contacts from the owner's gist and show it to "
+        "him in this chat with Send / Edit / Discard; nothing reaches the contact until he taps Send. Call it when "
+        "the owner tells you what to answer a contact, e.g. 'Ивану: да, в пятницу', typed or in a voice note. "
+        "Pass the owner's own words for the reply as `gist`, verbatim: do not reword, translate, or add dates or "
+        "facts. If the result lists several candidates or none, ask the owner which chat he means and call again "
+        "with the chat id. After 'shown', confirm in a few words; do not repeat the reply."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "contact": {"type": "string", "description": "The contact's name as the owner said it, or a chat id."},
+            "gist": {"type": "string", "description": "The owner's words for the reply, exactly as he said them."},
+        },
+        "required": ["contact", "gist"],
+    },
+}
+_TOOL_TIMEOUT_S = 120.0  # wording the gist is one model call; the preview send may wait for a reconnecting bot
+
+
 def _task_defaults(tag: str) -> dict:
     # Reasoning off: Qwen thinks by default and spent ~1.8k output tokens per draft; the replay eval showed the
     # same style, commas and ё without it (2026-10-23). The tag lets Langfuse sum each task's spend.
@@ -187,7 +212,21 @@ def register(ctx: Any) -> None:
     logger.info("telegram-business: persona from %s", persona_source)
 
     # Deferred singletons — constructed on first connect so import stays light.
-    _state: dict = {"db": None, "manager": None, "adapter": None}
+    _state: dict = {"db": None, "manager": None, "adapter": None, "loop": None}
+
+    def _secretary_reply(args: dict) -> str:
+        # Hermes runs tool handlers in a worker thread with its own loop; the bot's sends must run on the gateway
+        # loop the adapter lives on, or they deadlock (tools/send_message_tool.py, _dispatch_on_gateway_loop).
+        manager, loop = _state["manager"], _state["loop"]
+        if manager is None or loop is None:
+            return json.dumps({"status": "failed", "error": "the Telegram secretary is not connected"})
+        future = asyncio.run_coroutine_threadsafe(
+            manager.reply_from_dm(contact=str(args.get("contact", "")), gist=str(args.get("gist", ""))), loop)
+        return json.dumps(future.result(timeout=_TOOL_TIMEOUT_S), ensure_ascii=False)
+
+    ctx.register_tool(name="secretary_reply", toolset="telegram-business", schema=SECRETARY_TOOL_SCHEMA,
+                      handler=_secretary_reply, check_fn=lambda: _state["manager"] is not None,
+                      description="Reply to a Telegram Business contact from the owner's gist", emoji="✍")
 
     def _get_manager() -> BusinessModeManager:
         if _state["manager"] is not None:
@@ -252,6 +291,10 @@ def register(ctx: Any) -> None:
         )
 
         _state["adapter"] = adapter  # latest wiring wins (see _send_via)
+        try:  # connect() calls us on the gateway loop; a later rewire may not, and keeps the loop we have
+            _state["loop"] = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
         manager = _get_manager()
 
         async def _on_business_connection(update, context):

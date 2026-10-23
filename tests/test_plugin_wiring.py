@@ -19,6 +19,10 @@ class _FakeCtx:
     def register_auxiliary_task(self, key, **kwargs):
         self.aux_tasks[key] = kwargs
 
+    def register_tool(self, **kwargs):
+        self.tools = getattr(self, "tools", {})
+        self.tools[kwargs["name"]] = kwargs
+
     def register_telegram_handler(self, factory):
         assert callable(factory)
         self.factories.append(factory)
@@ -242,3 +246,29 @@ async def test_after_rewiring_messages_go_through_the_new_adapter(tmp_path, monk
                                  user_chat_id=100, is_enabled=True, rights=SimpleNamespace(can_reply=True))
     await on_connection(SimpleNamespace(business_connection=connection), None)
     second._bot.send_message.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_secretary_reply_tool_runs_on_the_gateway_loop(tmp_path, monkeypatch):
+    import json
+    ctx = _FakeCtx()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin.register(ctx)
+    tool = ctx.tools["secretary_reply"]
+    assert tool["toolset"] == "telegram-business"
+    assert tool["schema"]["parameters"]["required"] == ["contact", "gist"]
+    assert tool["check_fn"]() is False  # nothing to reply through before the gateway wires the plugin
+    application = MagicMock()
+    ctx.factories[0](application, SimpleNamespace(_bot=MagicMock(), name="telegram"))
+    assert tool["check_fn"]() is True
+    manager = _manager(application)
+    seen = []
+
+    async def _reply(*, contact, gist):
+        seen.append((contact, gist, asyncio.get_running_loop()))
+        return {"status": "shown", "contact": "Carol"}
+
+    monkeypatch.setattr(manager, "reply_from_dm", _reply)
+    result = await asyncio.to_thread(tool["handler"], {"contact": "Carol", "gist": "да"})  # Hermes's worker thread
+    assert json.loads(result) == {"status": "shown", "contact": "Carol"}
+    assert seen == [("Carol", "да", asyncio.get_running_loop())]
