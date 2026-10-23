@@ -333,6 +333,14 @@ class TestDraftOriginAndGist:
         at = db.last_contact_message_at("c1", "200")
         assert at is not None and at <= before
 
+    def test_contact_name_is_the_chat_s_own_even_when_another_name_holds_its_digits(self, db):
+        db.log_business_message("c1", "201", "Shop 201", "hi", message_id="1")
+        db.log_business_message("c1", "202", "Carol", "hi", message_id="2")
+        db.log_business_message("c1", "202", "Carol K.", "again", message_id="3")
+        assert db.contact_name("c1", "201") == "Shop 201"
+        assert db.contact_name("c1", "202") == "Carol K."
+        assert db.contact_name("c1", "999") is None
+
     def test_find_chats_by_part_of_the_name_or_by_id(self, db):
         db.log_business_message("c1", "201", "Ivan Petrov", "hi", message_id="1")
         db.log_business_message("c1", "202", "Ivan Sidorov", "hi", message_id="2")

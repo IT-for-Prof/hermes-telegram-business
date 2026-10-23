@@ -249,7 +249,7 @@ def register(ctx: Any) -> None:
                 {"role": "system", "content": f"{persona}\n\n{rules}"},
                 {"role": "user", "content": prompt_text},
             ]
-            task = GIST_TASK if rules == GIST_OUTPUT_RULES else DRAFT_TASK
+            task = {DRAFT_OUTPUT_RULES: DRAFT_TASK, GIST_OUTPUT_RULES: GIST_TASK}[rules]
             loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(
                 None,

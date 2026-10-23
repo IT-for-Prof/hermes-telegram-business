@@ -621,12 +621,7 @@ class BusinessModeManager:
             return True
 
         if choice == CHOICE_GIST:
-            owner_chat = str(conn["owner_chat_id"])
-            self._edit_capture.pop(owner_chat, None)
-            self._gist_capture[owner_chat] = {"conn_id": draft["connection_id"], "chat_id": draft["customer_chat_id"],
-                                              "origin": "gist_card", "card_id": draft_id}
-            await answer(text="✍ Жду суть")
-            await self._ask_for_gist(owner_chat, conn, draft["customer_chat_id"])
+            await self._start_gist(conn, draft["customer_chat_id"], "gist_card", draft_id, answer)
             return True
 
         if choice == CHOICE_EDIT:
@@ -882,9 +877,16 @@ class BusinessModeManager:
         return None
 
     def _contact_name(self, conn: Dict[str, Any], customer_chat_id: str) -> str:
-        found = [c for c in self._db.find_chats(conn["owner_user_id"], customer_chat_id)
-                 if c["connection_id"] == conn["connection_id"]]
-        return found[0]["name"] if found else "контакта"
+        return self._db.contact_name(conn["connection_id"], customer_chat_id) or "контакта"
+
+    async def _start_gist(self, conn: Dict[str, Any], customer_chat_id: str, origin: str, card_id: Optional[int],
+                          answer: Callable[..., Awaitable[Any]]) -> None:
+        owner_chat = str(conn["owner_chat_id"])
+        self._edit_capture.pop(owner_chat, None)
+        self._gist_capture[owner_chat] = {"conn_id": conn["connection_id"], "chat_id": customer_chat_id,
+                                          "origin": origin, "card_id": card_id}
+        await answer(text="✍ Жду суть")
+        await self._ask_for_gist(owner_chat, conn, customer_chat_id)
 
     async def _ask_for_gist(self, owner_chat: str, conn: Dict[str, Any], customer_chat_id: str) -> None:
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
@@ -903,12 +905,7 @@ class BusinessModeManager:
         if not conn:
             await answer(text="Чат не найден")
             return True
-        owner_chat = str(conn["owner_chat_id"])
-        self._edit_capture.pop(owner_chat, None)
-        self._gist_capture[owner_chat] = {"conn_id": conn["connection_id"], "chat_id": customer_chat_id,
-                                          "origin": "gist_digest", "card_id": None}
-        await answer(text="✍ Жду суть")
-        await self._ask_for_gist(owner_chat, conn, customer_chat_id)
+        await self._start_gist(conn, customer_chat_id, "gist_digest", None, answer)
         return True
 
     async def _cancel_gist(self, caller_user_id: Optional[str], answer: Callable[..., Awaitable[Any]],
@@ -1183,13 +1180,14 @@ def postprocess_draft(text: Optional[str]) -> Tuple[str, bool]:
         return "", True
     return _capitalize_sentences(text), False
 
+
 def postprocess_variants(text: Optional[str]) -> Tuple[List[str], bool]:
     """Model output -> (up to MAX_VARIANTS distinct replies, skipped), each block cleaned like a single draft."""
     if postprocess_draft(text)[1]:
         return [], True
     replies: List[str] = []
     for block in _VARIANT_SEPARATOR.split(text or ""):
-        reply, _ = postprocess_draft(block)  # a SKIP block among replies is dropped
+        reply, _ = postprocess_draft(block)
         if reply and reply not in replies:
             replies.append(reply)
     return replies[:MAX_VARIANTS], False

@@ -347,6 +347,16 @@ class BusinessStateDB:
             ).fetchone()
         return row[0]
 
+    def contact_name(self, connection_id: str, customer_chat_id: str) -> Optional[str]:
+        """The name the contact last wrote under in this chat, None if he never wrote."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT author FROM business_chat_log WHERE connection_id = ? AND customer_chat_id = ? "
+                "AND is_owner = 0 ORDER BY id DESC LIMIT 1",
+                (str(connection_id), str(customer_chat_id)),
+            ).fetchone()
+        return row[0] if row else None
+
     def find_chats(self, owner_user_id: str, query: str) -> List[Dict[str, Any]]:
         """This owner's logged chats whose id equals ``query`` or whose contact name contains it (any case)."""
         q = str(query).strip()
