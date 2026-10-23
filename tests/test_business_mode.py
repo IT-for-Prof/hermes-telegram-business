@@ -214,6 +214,138 @@ class TestBusinessDraftLifecycle:
         assert d2 not in ids
 
 
+class TestDraftOriginAndGist:
+    @pytest.fixture(autouse=True)
+    def _conn(self, db):
+        db.upsert_telegram_business_connection(
+            connection_id="c1", owner_user_id="42",
+            owner_chat_id="100", can_reply=True, is_enabled=True,
+        )
+
+    @staticmethod
+    def _card(db, chat="200"):
+        return db.create_telegram_business_draft(
+            connection_id="c1", owner_chat_id="100", customer_chat_id=chat,
+            customer_msg_id="m1", customer_text="Invoice by Friday?", draft_text="Yes",
+            variants=["Yes", "Monday instead?", "Which invoice?"],
+        )
+
+    @staticmethod
+    def _gist(db, card_id, chat="200", origin="gist_card"):
+        return db.create_telegram_business_draft(
+            connection_id="c1", owner_chat_id="100", customer_chat_id=chat,
+            customer_msg_id=None, customer_text="Invoice by Friday?", draft_text="Yes, Friday.",
+            origin=origin, gist="yes friday", card_id=card_id,
+        )
+
+    def test_database_from_the_old_schema_gains_the_columns_and_keeps_rows(self, tmp_path):
+        import sqlite3
+        path = tmp_path / "old.db"
+        con = sqlite3.connect(path)
+        con.executescript(
+            "CREATE TABLE business_drafts (draft_id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "connection_id TEXT NOT NULL, owner_chat_id TEXT NOT NULL, customer_chat_id TEXT NOT NULL, "
+            "customer_msg_id TEXT, customer_text TEXT NOT NULL, draft_text TEXT NOT NULL, "
+            "status TEXT NOT NULL DEFAULT 'pending', owner_message_id TEXT, final_sent_text TEXT, "
+            "created_at REAL NOT NULL, updated_at REAL NOT NULL, expires_at REAL NOT NULL);"
+            "INSERT INTO business_drafts (connection_id, owner_chat_id, customer_chat_id, customer_text, "
+            "draft_text, status, created_at, updated_at, expires_at) "
+            "VALUES ('c1', '100', '200', 'hi', 'hello', 'replied', 1, 1, 2);")
+        con.commit()
+        con.close()
+        sdb = BusinessStateDB(path)
+        try:
+            row = sdb.get_telegram_business_draft(1)
+            assert row["draft_text"] == "hello" and row["status"] == "replied"
+            assert {k: row[k] for k in ("variants", "origin", "sent_variant", "gist", "card_id")} == dict.fromkeys(
+                ("variants", "origin", "sent_variant", "gist", "card_id"))
+        finally:
+            sdb.close()
+        BusinessStateDB(path).close()  # a second open finds the columns and adds nothing
+
+    def test_card_stores_its_variants(self, db):
+        row = db.get_telegram_business_draft(self._card(db))
+        assert row["variants"] == ["Yes", "Monday instead?", "Which invoice?"]
+        assert row["origin"] is None
+
+    def test_gist_row_leaves_the_card_pending_until_it_is_sent(self, db):
+        card = self._card(db)
+        gist = self._gist(db, card)
+        row = db.get_telegram_business_draft(gist)
+        assert (row["origin"], row["gist"], row["card_id"], row["status"]) == ("gist_card", "yes friday", card, "pending")
+        assert db.get_telegram_business_draft(card)["status"] == "pending"
+        db.resolve_telegram_business_draft(gist, status="sent", final_sent_text="Yes, Friday.")
+        assert db.get_telegram_business_draft(card)["status"] == "gisted"
+
+    def test_discarded_gist_leaves_the_card_pending(self, db):
+        card = self._card(db)
+        db.resolve_telegram_business_draft(self._gist(db, card), status="discarded")
+        assert db.get_telegram_business_draft(card)["status"] == "pending"
+
+    def test_edited_gist_also_closes_the_card(self, db):
+        card = self._card(db)
+        db.resolve_telegram_business_draft(self._gist(db, card), status="edited", final_sent_text="Friday")
+        assert db.get_telegram_business_draft(card)["status"] == "gisted"
+
+    def test_a_second_gist_replaces_the_first_but_not_the_card(self, db):
+        card = self._card(db)
+        first = self._gist(db, card)
+        second = self._gist(db, card)
+        assert db.get_telegram_business_draft(first)["status"] == "superseded"
+        assert db.get_telegram_business_draft(second)["status"] == "pending"
+        assert db.get_telegram_business_draft(card)["status"] == "pending"
+
+    def test_new_card_supersedes_a_waiting_gist_and_the_old_card(self, db):
+        card = self._card(db)
+        gist = self._gist(db, card)
+        self._card(db)
+        assert db.get_telegram_business_draft(card)["status"] == "superseded"
+        assert db.get_telegram_business_draft(gist)["status"] == "superseded"
+
+    def test_copy_row_is_final_and_leaves_the_card_alone(self, db):
+        card = self._card(db)
+        copy = db.create_telegram_business_draft(
+            connection_id="c1", owner_chat_id="100", customer_chat_id="200", customer_msg_id=None,
+            customer_text="", draft_text="Yes, Friday.", origin="gist_digest", gist="yes", status="copy",
+        )
+        assert db.get_telegram_business_draft(copy)["status"] == "copy"
+        assert db.get_telegram_business_draft(card)["status"] == "pending"
+
+    def test_sent_variant_is_stored(self, db):
+        card = self._card(db)
+        db.resolve_telegram_business_draft(card, status="sent", final_sent_text="Monday instead?", sent_variant=2)
+        row = db.get_telegram_business_draft(card)
+        assert (row["status"], row["sent_variant"], row["final_sent_text"]) == ("sent", 2, "Monday instead?")
+
+    def test_purge_forgets_variants_and_gists(self, db):
+        card = self._card(db)
+        gist = self._gist(db, card)
+        db.purge_business_chat_log("c1", "200")
+        for did in (card, gist):
+            row = db.get_telegram_business_draft(did)
+            assert row["variants"] is None and row["gist"] is None and row["draft_text"] == ""
+
+    def test_last_contact_message_ignores_the_owner(self, db):
+        assert db.last_contact_message_at("c1", "200") is None
+        db.log_business_message("c1", "200", "Carol", "hi", message_id="1")
+        before = time.time()
+        db.log_business_message("c1", "200", "Owner", "hello", message_id="2", is_owner=True)
+        at = db.last_contact_message_at("c1", "200")
+        assert at is not None and at <= before
+
+    def test_find_chats_by_part_of_the_name_or_by_id(self, db):
+        db.log_business_message("c1", "201", "Ivan Petrov", "hi", message_id="1")
+        db.log_business_message("c1", "202", "Ivan Sidorov", "hi", message_id="2")
+        db.log_business_message("c1", "203", "Carol", "hi", message_id="3")
+        db.log_business_message("c1", "203", "Owner", "hello", message_id="4", is_owner=True)
+        found = db.find_chats("42", "ivan")
+        assert sorted((c["customer_chat_id"], c["name"]) for c in found) == [
+            ("201", "Ivan Petrov"), ("202", "Ivan Sidorov")]
+        assert [(c["connection_id"], c["name"]) for c in db.find_chats("42", "203")] == [("c1", "Carol")]
+        assert db.find_chats("42", "nobody") == []
+        assert db.find_chats("7", "carol") == []  # another owner's chats are never found
+
+
 # =========================================================================
 # Manager orchestration
 # =========================================================================

@@ -80,6 +80,15 @@ CREATE INDEX IF NOT EXISTS idx_biz_log_chat
     ON business_chat_log(connection_id, customer_chat_id, id);
 """
 
+# Added after the first release; ALTER TABLE adds them to older databases on open.
+#   variants      JSON list of the card's replies (draft_text keeps the first)
+#   origin        NULL for a card; gist_card / gist_dm / gist_digest for a gist reply
+#   sent_variant  the number of the variant the owner sent
+#   gist          the owner's gist as typed, transcribed or passed to the tool
+#   card_id       on a gist row: the chat's card it closes as ``gisted`` once sent
+_ADDED_DRAFT_COLUMNS = (("variants", "TEXT"), ("origin", "TEXT"), ("sent_variant", "INTEGER"),
+                        ("gist", "TEXT"), ("card_id", "INTEGER"))
+
 
 class BusinessStateDB:
     """Thread-safe SQLite store for connections + drafts."""
@@ -92,6 +101,10 @@ class BusinessStateDB:
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            have = {r[1] for r in self._conn.execute("PRAGMA table_info(business_drafts)")}
+            for name, kind in _ADDED_DRAFT_COLUMNS:
+                if name not in have:
+                    self._conn.execute(f"ALTER TABLE business_drafts ADD COLUMN {name} {kind}")
             self._conn.commit()
 
     def close(self) -> None:
@@ -220,30 +233,38 @@ class BusinessStateDB:
         draft_text: str,
         ttl_seconds: float = 86400.0,
         status: str = "pending",
+        variants: Optional[List[str]] = None,
+        origin: Optional[str] = None,
+        gist: Optional[str] = None,
+        card_id: Optional[int] = None,
     ) -> int:
         """Insert a pending draft row and return its draft_id.
 
         Any prior pending drafts for the same (connection, customer_chat)
         are marked superseded so only one Send button is ever live per
-        conversation. ``status="skipped"`` (no reply needed) leaves them alone.
+        conversation. A gist row (``origin`` set) supersedes only earlier
+        gist rows: the card stays pending, buttonless, until the gist is sent.
+        ``status="skipped"`` (no reply needed) and ``"copy"`` leave them alone.
         """
         now = time.time()
         with self._lock:
             if status == "pending":
-                self._supersede_pending(now, connection_id, customer_chat_id)
+                self._supersede_pending(now, connection_id, customer_chat_id, gists_only=origin is not None)
             cur = self._conn.execute(
                 """
                 INSERT INTO business_drafts (
                     connection_id, owner_chat_id, customer_chat_id,
                     customer_msg_id, customer_text, draft_text,
-                    status, created_at, updated_at, expires_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    status, created_at, updated_at, expires_at,
+                    variants, origin, gist, card_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(connection_id), str(owner_chat_id), str(customer_chat_id),
                     str(customer_msg_id) if customer_msg_id is not None else None,
                     customer_text, draft_text, status,
                     now, now, now + max(60.0, float(ttl_seconds)),
+                    json.dumps(variants, ensure_ascii=False) if variants else None, origin, gist, card_id,
                 ),
             )
             self._conn.commit()
@@ -316,6 +337,30 @@ class BusinessStateDB:
             return [tuple(r) for r in self._conn.execute(
                 "SELECT connection_id, customer_chat_id FROM business_pending_forgets ORDER BY 1, 2").fetchall()]
 
+    def last_contact_message_at(self, connection_id: str, customer_chat_id: str) -> Optional[float]:
+        """When the contact last wrote in this chat (Telegram's 24-hour reply window), None if never."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT max(created_at) FROM business_chat_log WHERE connection_id = ? "
+                "AND customer_chat_id = ? AND is_owner = 0",
+                (str(connection_id), str(customer_chat_id)),
+            ).fetchone()
+        return row[0]
+
+    def find_chats(self, owner_user_id: str, query: str) -> List[Dict[str, Any]]:
+        """This owner's logged chats whose id equals ``query`` or whose contact name contains it (any case)."""
+        q = str(query).strip()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT l.connection_id, l.customer_chat_id, l.author FROM business_chat_log l "
+                "JOIN business_connections c ON c.connection_id = l.connection_id "
+                "WHERE c.owner_user_id = ? AND l.id = (SELECT max(id) FROM business_chat_log "
+                "  WHERE connection_id = l.connection_id AND customer_chat_id = l.customer_chat_id AND is_owner = 0)",
+                (str(owner_user_id),),
+            ).fetchall()
+        return [{"connection_id": r[0], "customer_chat_id": r[1], "name": r[2]} for r in rows
+                if q and (r[1] == q or q.casefold() in r[2].casefold())]
+
     def chats_in_log(self, connection_id: str) -> List[str]:
         with self._lock:
             rows = self._conn.execute("SELECT DISTINCT customer_chat_id FROM business_chat_log WHERE connection_id = ?",
@@ -334,6 +379,7 @@ class BusinessStateDB:
             self._conn.execute(f"DELETE FROM business_chat_log WHERE {where}", args)
             self._conn.execute(
                 "UPDATE business_drafts SET customer_text = '', draft_text = '', final_sent_text = NULL, "
+                "variants = NULL, gist = NULL, "
                 f"status = CASE WHEN status = 'pending' THEN 'expired' ELSE status END WHERE {where}", args)
             self._conn.commit()
 
@@ -371,11 +417,12 @@ class BusinessStateDB:
             self._conn.commit()
 
     def _supersede_pending(self, now: float, connection_id: str, customer_chat_id: str,
-                           status: str = "superseded") -> None:
+                           status: str = "superseded", gists_only: bool = False) -> None:
         """Caller holds ``self._lock`` and commits."""
         self._conn.execute(
             "UPDATE business_drafts SET status = ?, updated_at = ? "
-            "WHERE connection_id = ? AND customer_chat_id = ? AND status = 'pending'",
+            "WHERE connection_id = ? AND customer_chat_id = ? AND status = 'pending'"
+            + (" AND origin IS NOT NULL" if gists_only else ""),
             (status, now, str(connection_id), str(customer_chat_id)),
         )
 
@@ -385,7 +432,11 @@ class BusinessStateDB:
                 "SELECT * FROM business_drafts WHERE draft_id = ?",
                 (int(draft_id),),
             ).fetchone()
-        return dict(row) if row is not None else None
+        if row is None:
+            return None
+        draft = dict(row)
+        draft["variants"] = json.loads(draft["variants"]) if draft["variants"] else None
+        return draft
 
     def set_telegram_business_draft_owner_message(
         self, draft_id: int, owner_message_id: str
@@ -404,11 +455,13 @@ class BusinessStateDB:
         *,
         status: str,
         final_sent_text: Optional[str] = None,
+        sent_variant: Optional[int] = None,
     ) -> Optional[Dict[str, Any]]:
         """Atomically mark a draft sent / edited / discarded / expired.
 
         Returns the prior row, or None if the draft no longer exists or was
         already resolved (so callbacks for stale buttons no-op safely).
+        A gist row that goes out closes its card as ``gisted``.
         """
         if status not in {"sent", "edited", "discarded", "expired"}:
             raise ValueError(f"invalid business draft status: {status}")
@@ -423,9 +476,16 @@ class BusinessStateDB:
             self._conn.execute(
                 "UPDATE business_drafts SET status = ?, "
                 "final_sent_text = COALESCE(?, final_sent_text), "
+                "sent_variant = COALESCE(?, sent_variant), "
                 "updated_at = ? WHERE draft_id = ?",
-                (status, final_sent_text, now, int(draft_id)),
+                (status, final_sent_text, sent_variant, now, int(draft_id)),
             )
+            if status in {"sent", "edited"} and row["card_id"] is not None:
+                self._conn.execute(
+                    "UPDATE business_drafts SET status = 'gisted', updated_at = ? "
+                    "WHERE draft_id = ? AND status = 'pending'",
+                    (now, int(row["card_id"])),
+                )
             self._conn.commit()
             return dict(row)
 
