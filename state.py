@@ -358,7 +358,8 @@ class BusinessStateDB:
         return row[0] if row else None
 
     def find_chats(self, owner_user_id: str, query: str) -> List[Dict[str, Any]]:
-        """This owner's logged chats whose id equals ``query`` or whose contact name contains it (any case)."""
+        """This owner's logged chats whose id equals ``query`` or whose contact name contains it (any case);
+        an empty query lists them all."""
         q = str(query).strip()
         with self._lock:
             rows = self._conn.execute(
@@ -369,7 +370,7 @@ class BusinessStateDB:
                 (str(owner_user_id),),
             ).fetchall()
         return [{"connection_id": r[0], "customer_chat_id": r[1], "name": r[2]} for r in rows
-                if q and (r[1] == q or q.casefold() in r[2].casefold())]
+                if r[1] == q or q.casefold() in r[2].casefold()]
 
     def chats_in_log(self, connection_id: str) -> List[str]:
         with self._lock:

@@ -807,13 +807,19 @@ class BusinessModeManager:
         return True
 
     async def word_gist(self, *, conn_id: str, customer_chat_id: str, gist: str, origin: str,
-                        card_id: Optional[int] = None) -> bool:
+                        card_id: Optional[int] = None) -> Optional[str]:
         """Word the owner's gist as his reply and show it to him: with Send inside Telegram's reply window,
-        for copying outside it. ``card_id`` defaults to the chat's live card. False when nothing was shown."""
+        for copying outside it. ``card_id`` names the card the gist was started from; the chat's live card
+        is closed either way. Returns "send" or "copy" (how it was shown), None when nothing was shown."""
         conn = self._db.get_telegram_business_connection(conn_id)
         if not conn:
-            return False
+            return None
         owner_chat = str(conn["owner_chat_id"])
+        if not conn.get("is_enabled") or customer_chat_id in (conn.get("paused_chats") or []):
+            # muted with /biz off or disconnected while the gist was awaited: its history is erased
+            self._gist_capture.pop(owner_chat, None)
+            await self._notify(owner_chat, "✍ Этот чат отключён, суть не принята.")
+            return None
         name = self._contact_name(conn, customer_chat_id)
         log = self._db.get_business_chat_log(conn_id, customer_chat_id)
         prompt = gist_prompt(log, name, self._style_examples(conn, customer_chat_id), gist)
@@ -823,10 +829,10 @@ class BusinessModeManager:
         except Exception as exc:
             logger.exception("Business gist wording failed: %s", exc)
             await self._notify(owner_chat, f"⚠️ Не получилось написать ответ по сути: {exc}. Попробуйте ещё раз.")
-            return False
+            return None
         if not replies:
             await self._notify(owner_chat, "⚠️ Модель вернула пустой ответ. Попробуйте сказать суть иначе.")
-            return False
+            return None
         reply = replies[0]
         card = self._live_card(owner_chat, conn_id, customer_chat_id, card_id)
         contact_text = next((r["text"] for r in reversed(log) if not r["is_owner"]), "")
@@ -840,41 +846,53 @@ class BusinessModeManager:
                 f"✍ Ответ для {html.escape(name)} по вашей сути. Отправить от вашего имени нельзя: контакт "
                 "не писал больше суток или отправка выключена. Скопируйте и отправьте сами:\n\n"
                 f"<code>{html.escape(reply)}</code>\n\nСуть: {html.escape(gist)}"))
-            return True
+            return "copy"
         gist_id = self._db.create_telegram_business_draft(
             **row, card_id=card["draft_id"] if card else None, ttl_seconds=self._draft_ttl_seconds)
-        if card and card.get("owner_message_id"):
-            await self._set_card_buttons(owner_chat, card["owner_message_id"], None)
-        sent = await self._send(
-            chat_id=int(owner_chat), disable_notification=False, reply_markup=self._build_gist_keyboard(gist_id),
-            text=f"✍ Ответ для {name} по вашей сути:\n{reply}\n\nСуть: {gist}")
+        try:
+            sent = await self._send(
+                chat_id=int(owner_chat), disable_notification=False, reply_markup=self._build_gist_keyboard(gist_id),
+                text=f"✍ Ответ для {name} по вашей сути:\n{reply}\n\nСуть: {gist}")
+        except Exception as exc:
+            logger.warning("Business gist preview failed for chat %s: %s", customer_chat_id, exc)
+            self._db.resolve_telegram_business_draft(gist_id, status="discarded")
+            await self._notify(owner_chat, f"⚠️ Не удалось показать ответ по сути ({exc}). Пришлите суть ещё раз.")
+            return None
         if getattr(sent, "message_id", None) is not None:
             self._db.set_telegram_business_draft_owner_message(gist_id, str(sent.message_id))
-        return True
+        if card and card.get("owner_message_id"):  # only now: a failed preview must not strand the card
+            await self._set_card_buttons(owner_chat, card["owner_message_id"], None)
+        return "send"
 
-    async def reply_from_dm(self, *, contact: str, gist: str) -> Dict[str, Any]:
-        """The bot-DM path (Hermes agent's ``secretary_reply`` tool): find the one chat ``contact`` names and show
-        the gist reply there, or list the candidates so the agent asks the owner which chat he means."""
-        owners = {c["owner_user_id"] for c in self._db.list_telegram_business_connections(enabled_only=True)}
-        found = [c for owner in sorted(owners) for c in self._db.find_chats(owner, contact)]
-        if not found:
-            return {"status": "no_match"}
-        if len(found) > 1:
-            return {"status": "ambiguous",
-                    "candidates": sorted(f"{c['name']} (chat {c['customer_chat_id']})" for c in found)}
+    async def reply_from_dm(self, *, owner_user_id: str, contact: str, gist: str) -> Dict[str, Any]:
+        """The bot-DM path (Hermes agent's ``secretary_reply`` tool): find the one chat of this owner that
+        ``contact`` names and show the gist reply there, or list candidates so the agent asks which chat."""
+        query = contact.strip()
+        found = self._db.find_chats(owner_user_id, query)
+        # Russian names arrive declined ("Ивану", "Маше", "Сергею"): retry without the ending
+        for cut in (1, 2):
+            if found or len(query) - cut < 3:
+                break
+            found = self._db.find_chats(owner_user_id, query[:-cut])
+        if len(found) != 1:
+            pool = found or self._db.find_chats(owner_user_id, "")
+            return {"status": "ambiguous" if found else "no_match",
+                    "candidates": sorted(f"{c['name']} (chat {c['customer_chat_id']})" for c in pool)[:10]}
         chat = found[0]
-        shown = await self.word_gist(conn_id=chat["connection_id"], customer_chat_id=chat["customer_chat_id"],
-                                     gist=gist.strip(), origin="gist_dm")
-        return {"status": "shown", "contact": chat["name"]} if shown else {"status": "failed"}
+        mode = await self.word_gist(conn_id=chat["connection_id"], customer_chat_id=chat["customer_chat_id"],
+                                    gist=gist.strip(), origin="gist_dm")
+        if mode is None:
+            return {"status": "failed", "error": "the owner was told why in the bot chat"}
+        return {"status": "shown", "mode": mode, "contact": chat["name"]}
 
     def _live_card(self, owner_chat: str, conn_id: str, customer_chat_id: str,
                    card_id: Optional[int]) -> Optional[Dict[str, Any]]:
-        """The chat's pending card (not a gist preview) that this gist would close, if any."""
-        for row in reversed(self._db.get_pending_telegram_business_drafts_for_owner(owner_chat)):
-            if (row["connection_id"] == conn_id and row["customer_chat_id"] == customer_chat_id
-                    and row["origin"] is None and (card_id is None or row["draft_id"] == card_id)):
-                return row
-        return None
+        """The chat's pending card (not a gist preview) that this gist would close: the one it was started from,
+        else the chat's newest card (a newer card supersedes the one the owner tapped)."""
+        cards = [row for row in self._db.get_pending_telegram_business_drafts_for_owner(owner_chat)
+                 if row["connection_id"] == conn_id and row["customer_chat_id"] == customer_chat_id
+                 and row["origin"] is None]
+        return next((c for c in cards if c["draft_id"] == card_id), cards[-1] if cards else None)
 
     def _contact_name(self, conn: Dict[str, Any], customer_chat_id: str) -> str:
         return self._db.contact_name(conn["connection_id"], customer_chat_id) or "контакта"
@@ -1129,11 +1147,11 @@ _PRIVATE_DETAIL = re.compile(r"https?://|www\.|@\w|\S+@\S+\.\w+|\d{3,}")
 
 # Appended to the owner persona to form the drafting system prompt.
 DRAFT_OUTPUT_RULES = (
-    "Output 2 or 3 alternative replies to the latest message(s), separated by a line containing only ---. "
-    "The owner reads them all and sends one with a single tap, so each reply is a complete message he could "
+    "For this answer the one-draft format described above changes: output 2 or 3 alternative replies to the "
+    "latest message(s), separated by a line containing only ---. The owner reads them all and sends one with a single tap, so each reply is a complete message he could "
     "send as is, and each takes a different decision he might make: for example agree, propose something else, "
-    "or ask what exactly is meant. Because he chooses, a reply may take a decision for him, but never one that "
-    "reverses what he already said above. For a message with nothing to decide, a short reaction and a question "
+    "or ask what exactly is meant. Because he picks one, a reply may take a decision for him (the choice stays "
+    "his), but never one that reverses what he already said above. For a message with nothing to decide, a short reaction and a question "
     "are good alternatives. Each reply carries one decision and adds no fact, date, amount or commitment that is "
     "not in the conversation. No numbering, preamble, quotes or markdown. Keep each reply under 4 sentences "
     "unless the customer asked something that genuinely needs a longer reply."

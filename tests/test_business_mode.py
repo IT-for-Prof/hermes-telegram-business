@@ -862,6 +862,62 @@ class TestOwnGist:
         assert self._preview(db, card["draft_id"])["gist"] == "да"
 
     @pytest.mark.asyncio
+    async def test_a_failed_preview_keeps_the_card_and_the_waiting_gist(self, db):
+        mgr, sender, card = await self._card(db, replies=["Да.", "Да."])
+        await _tap(mgr, f"bd:gist:{card['draft_id']}")
+        real_send = sender.__call__
+
+        async def _down(**kw):
+            if "Ответ для" in kw.get("text", ""):
+                raise RuntimeError("bot reconnecting")
+            return await real_send(**kw)
+
+        mgr._send = _down
+        assert await mgr.maybe_handle_edit_capture(owner_chat_id="100", text="да") is True
+        assert sender.markups == []                                    # the card keeps its buttons
+        assert "bot reconnecting" in sender.calls[-1]["text"]
+        assert db.get_telegram_business_draft(card["draft_id"])["status"] == "pending"
+        mgr._send = sender
+        assert await mgr.maybe_handle_edit_capture(owner_chat_id="100", text="да") is True
+        assert self._preview(db, card["draft_id"])["gist"] == "да"     # the capture was still armed
+
+    @pytest.mark.asyncio
+    async def test_a_gist_after_a_newer_card_closes_the_newer_card(self, db):
+        mgr, sender, card_a = await self._card(db, replies=[self.CARD, "Да, в пятницу."])
+        await _tap(mgr, f"bd:gist:{card_a['draft_id']}")
+        await mgr.handle_business_message(_fake_business_message(text="И акт тоже", msg_id=77))
+        card_b = db.get_pending_telegram_business_drafts_for_owner("100")[0]
+        assert card_b["draft_id"] != card_a["draft_id"]
+        await mgr.maybe_handle_edit_capture(owner_chat_id="100", text="да")
+        gist = self._preview(db, card_b["draft_id"])
+        assert gist["card_id"] == card_b["draft_id"]
+        assert sender.markups[-1]["message_id"] == int(card_b["owner_message_id"])
+
+    @pytest.mark.asyncio
+    async def test_a_failed_wording_tells_the_owner_and_keeps_waiting(self, db):
+        mgr, sender, card = await self._card(db)
+        await _tap(mgr, f"bd:gist:{card['draft_id']}")
+
+        async def _boom(prompt, chat_id, rules=None):
+            raise RuntimeError("model down")
+
+        mgr._draft_generator = _boom
+        assert await mgr.maybe_handle_edit_capture(owner_chat_id="100", text="да") is True
+        assert "model down" in sender.calls[-1]["text"]
+        assert self._preview(db, card["draft_id"]) is None
+        assert "100" in mgr._gist_capture
+
+    @pytest.mark.asyncio
+    async def test_a_chat_muted_while_the_gist_waits_takes_no_gist(self, db):
+        mgr, sender, card = await self._card(db)
+        await _tap(mgr, f"bd:gist:{card['draft_id']}")
+        await mgr.handle_biz_command(owner_user_id="42", owner_chat_id="100", args=["off", "200"])
+        assert await mgr.maybe_handle_edit_capture(owner_chat_id="100", text="да") is True
+        assert "отключён" in sender.calls[-1]["text"]
+        assert not db._conn.execute("SELECT count(*) FROM business_drafts WHERE origin IS NOT NULL").fetchone()[0]
+        assert await mgr.maybe_handle_edit_capture(owner_chat_id="100", text="hello agent") is False
+
+    @pytest.mark.asyncio
     async def test_hand_reply_in_the_chat_ends_the_waiting_gist(self, db):
         mgr, sender, card = await self._card(db)
         await _tap(mgr, f"bd:gist:{card['draft_id']}")
@@ -875,7 +931,7 @@ class TestGistFromTheBotDm:
         mgr, sender = _make_manager(db, replies=list(replies))
         await mgr.handle_connection_update(_fake_business_connection())
         db.set_telegram_business_auto_draft("conn1", auto_draft=False)
-        for chat, name in ((201, "Ivan Petrov"), (202, "Ivan Sidorov"), (203, "Carol")):
+        for chat, name in ((201, "Ivan Petrov"), (202, "Ivan Sidorov"), (203, "Carol"), (204, "Маша Котова")):
             msg = _fake_business_message(customer_chat_id=chat, text="привет", msg_id=chat)
             msg.from_user.full_name = name
             await mgr.handle_business_message(msg)
@@ -886,18 +942,18 @@ class TestGistFromTheBotDm:
     async def test_two_matching_names_are_listed_and_nothing_is_written(self, db):
         """Covers AE4."""
         mgr, sender = await self._chats(db)
-        result = await mgr.reply_from_dm(contact="Иван", gist="да, в пятницу")
-        assert result["status"] == "no_match"
-        result = await mgr.reply_from_dm(contact="Ivan", gist="да, в пятницу")
+        result = await mgr.reply_from_dm(owner_user_id="42", contact="Ivan", gist="да, в пятницу")
         assert result == {"status": "ambiguous", "candidates": ["Ivan Petrov (chat 201)", "Ivan Sidorov (chat 202)"]}
+        result = await mgr.reply_from_dm(owner_user_id="42", contact="Пётр", gist="да")
+        assert result["status"] == "no_match" and len(result["candidates"]) == 4   # the agent can offer his chats
         assert sender.calls == [] and sender.generated == []
         assert db.get_pending_telegram_business_drafts_for_owner("100") == []
 
     @pytest.mark.asyncio
     async def test_one_match_shows_a_gist_dm_preview(self, db):
         mgr, sender = await self._chats(db, replies=["Да, в пятницу."])
-        result = await mgr.reply_from_dm(contact="carol", gist="да, в пятницу")
-        assert result == {"status": "shown", "contact": "Carol"}
+        result = await mgr.reply_from_dm(owner_user_id="42", contact="carol", gist="да, в пятницу")
+        assert result == {"status": "shown", "mode": "send", "contact": "Carol"}
         rows = db.get_pending_telegram_business_drafts_for_owner("100")
         assert [(r["customer_chat_id"], r["origin"], r["gist"]) for r in rows] == [("203", "gist_dm", "да, в пятницу")]
         assert sender.calls[-1]["chat_id"] == 100 and "Да, в пятницу." in sender.calls[-1]["text"]
@@ -905,7 +961,18 @@ class TestGistFromTheBotDm:
     @pytest.mark.asyncio
     async def test_a_chat_id_picks_the_chat(self, db):
         mgr, sender = await self._chats(db, replies=["Да."])
-        assert (await mgr.reply_from_dm(contact="202", gist="да"))["contact"] == "Ivan Sidorov"
+        assert (await mgr.reply_from_dm(owner_user_id="42", contact="202", gist="да"))["contact"] == "Ivan Sidorov"
+
+    @pytest.mark.asyncio
+    async def test_a_declined_russian_name_finds_the_chat(self, db):
+        mgr, sender = await self._chats(db, replies=["Да."])
+        assert (await mgr.reply_from_dm(owner_user_id="42", contact="Маше", gist="да"))["contact"] == "Маша Котова"
+
+    @pytest.mark.asyncio
+    async def test_another_owner_finds_none_of_these_chats(self, db):
+        mgr, sender = await self._chats(db)
+        result = await mgr.reply_from_dm(owner_user_id="7", contact="carol", gist="да")
+        assert result == {"status": "no_match", "candidates": []} and sender.calls == []
 
 
 class TestGistFromTheDigest:

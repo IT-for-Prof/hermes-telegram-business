@@ -263,12 +263,50 @@ async def test_secretary_reply_tool_runs_on_the_gateway_loop(tmp_path, monkeypat
     assert tool["check_fn"]() is True
     manager = _manager(application)
     seen = []
+    session = {"HERMES_SESSION_PLATFORM": "telegram", "HERMES_SESSION_USER_ID": "42"}
+    _session_env(monkeypatch, session)
 
-    async def _reply(*, contact, gist):
-        seen.append((contact, gist, asyncio.get_running_loop()))
-        return {"status": "shown", "contact": "Carol"}
+    async def _reply(*, owner_user_id, contact, gist):
+        seen.append((owner_user_id, contact, gist, asyncio.get_running_loop()))
+        return {"status": "shown", "mode": "send", "contact": "Carol"}
 
     monkeypatch.setattr(manager, "reply_from_dm", _reply)
     result = await asyncio.to_thread(tool["handler"], {"contact": "Carol", "gist": "да"})  # Hermes's worker thread
-    assert json.loads(result) == {"status": "shown", "contact": "Carol"}
-    assert seen == [("Carol", "да", asyncio.get_running_loop())]
+    assert json.loads(result) == {"status": "shown", "mode": "send", "contact": "Carol"}
+    assert seen == [("42", "Carol", "да", asyncio.get_running_loop())]
+
+    session["HERMES_SESSION_PLATFORM"] = "cli"        # a cron or CLI turn has no owner to show a preview to
+    assert json.loads(await asyncio.to_thread(tool["handler"], {"contact": "Carol", "gist": "да"}))["status"] == "failed"
+    assert len(seen) == 1
+
+
+def _session_env(monkeypatch, values):
+    import sys
+    import types
+    mod = types.ModuleType("gateway.session_context")
+    mod.get_session_env = lambda name, default="": values.get(name, default)
+    monkeypatch.setitem(sys.modules, "gateway", types.ModuleType("gateway"))
+    monkeypatch.setitem(sys.modules, "gateway.session_context", mod)
+
+
+@pytest.mark.asyncio
+async def test_secretary_reply_timeout_cancels_and_reports_failure(tmp_path, monkeypatch):
+    import json
+    ctx = _FakeCtx()
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    plugin.register(ctx)
+    application = MagicMock()
+    ctx.factories[0](application, SimpleNamespace(_bot=MagicMock(), name="telegram"))
+    _session_env(monkeypatch, {"HERMES_SESSION_PLATFORM": "telegram", "HERMES_SESSION_USER_ID": "42"})
+    monkeypatch.setattr(plugin, "_TOOL_TIMEOUT_S", 0.05)
+    finished = []
+
+    async def _slow(**kw):
+        await asyncio.sleep(1)
+        finished.append(1)
+
+    monkeypatch.setattr(_manager(application), "reply_from_dm", _slow)
+    result = await asyncio.to_thread(ctx.tools["secretary_reply"]["handler"], {"contact": "c", "gist": "g"})
+    assert json.loads(result)["status"] == "failed"
+    await asyncio.sleep(0.05)
+    assert finished == []                               # cancelled: no late preview

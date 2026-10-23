@@ -169,7 +169,8 @@ SECRETARY_TOOL_SCHEMA = {
     "name": "secretary_reply",
     "description": (
         "Prepare a reply to one of the owner's Telegram Business contacts from the owner's gist and show it to "
-        "him in this chat with Send / Edit / Discard; nothing reaches the contact until he taps Send. Call it when "
+        "him in this chat with Send / Edit / Discard (or for copying, when Telegram no longer lets the bot reply "
+        "in that chat); nothing reaches the contact until he taps Send. Call it when "
         "the owner tells you what to answer a contact, e.g. 'Ивану: да, в пятницу', typed or in a voice note. "
         "Pass the owner's own words for the reply as `gist`, verbatim: do not reword, translate, or add dates or "
         "facts. If the result lists several candidates or none, ask the owner which chat he means and call again "
@@ -178,7 +179,8 @@ SECRETARY_TOOL_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "contact": {"type": "string", "description": "The contact's name as the owner said it, or a chat id."},
+            "contact": {"type": "string", "description": "The contact's name in its base form, as it would appear "
+                        "in the chat ('Иван' for 'Ивану'), or a chat id."},
             "gist": {"type": "string", "description": "The owner's words for the reply, exactly as he said them."},
         },
         "required": ["contact", "gist"],
@@ -215,14 +217,24 @@ def register(ctx: Any) -> None:
     _state: dict = {"db": None, "manager": None, "adapter": None, "loop": None}
 
     def _secretary_reply(args: dict) -> str:
-        # Hermes runs tool handlers in a worker thread with its own loop; the bot's sends must run on the gateway
-        # loop the adapter lives on, or they deadlock (tools/send_message_tool.py, _dispatch_on_gateway_loop).
         manager, loop = _state["manager"], _state["loop"]
         if manager is None or loop is None:
             return json.dumps({"status": "failed", "error": "the Telegram secretary is not connected"})
-        future = asyncio.run_coroutine_threadsafe(
-            manager.reply_from_dm(contact=str(args.get("contact", "")), gist=str(args.get("gist", ""))), loop)
-        return json.dumps(future.result(timeout=_TOOL_TIMEOUT_S), ensure_ascii=False)
+        # Only the account owner, from his own Telegram chat with the bot, and only among his own chats: anyone
+        # can connect a Business account to the bot, and cron or CLI turns have no owner to ask.
+        from gateway.session_context import get_session_env
+        user = get_session_env("HERMES_SESSION_USER_ID")
+        if get_session_env("HERMES_SESSION_PLATFORM") != "telegram" or not user:
+            return json.dumps({"status": "failed", "error": "only from the owner's Telegram chat with the bot"})
+        # Hermes runs tool handlers in a worker thread with its own loop; the bot's sends must run on the gateway
+        # loop the adapter lives on, or they deadlock (tools/send_message_tool.py, _dispatch_on_gateway_loop).
+        future = asyncio.run_coroutine_threadsafe(manager.reply_from_dm(
+            owner_user_id=user, contact=str(args.get("contact", "")), gist=str(args.get("gist", ""))), loop)
+        try:
+            return json.dumps(future.result(timeout=_TOOL_TIMEOUT_S), ensure_ascii=False)
+        except TimeoutError:
+            future.cancel()  # a late preview would contradict the failure reported to the agent
+            return json.dumps({"status": "failed", "error": "timed out; nothing was shown"})
 
     ctx.register_tool(name="secretary_reply", toolset="telegram-business", schema=SECRETARY_TOOL_SCHEMA,
                       handler=_secretary_reply, check_fn=lambda: _state["manager"] is not None,
