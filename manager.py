@@ -59,10 +59,13 @@ logger = logging.getLogger(__name__)
 CALLBACK_PREFIX = "bd:"
 
 
-# Choice values rendered on the inline keyboard.
+# Choice values rendered on the inline keyboard. "v<N>" sends reply N of the card;
+# "send" is the button of cards sent before variants existed and means reply 1.
 CHOICE_SEND = "send"
+CHOICE_VARIANT = "v"
 CHOICE_EDIT = "edit"
 CHOICE_DISCARD = "discard"
+MAX_VARIANTS = 3
 
 
 # Onboarding text the bot DMs the owner the first time a BusinessConnection
@@ -478,7 +481,8 @@ class BusinessModeManager:
                     logger.exception("Business-mode could not record the failed draft")
             return
 
-        draft_text, skipped = postprocess_draft(draft_text)
+        variants, skipped = postprocess_variants(draft_text)
+        draft_text = variants[0] if variants else ""
         if not draft_text and not skipped:
             logger.debug("Empty draft for %s — skipping", key)
             return
@@ -499,15 +503,17 @@ class BusinessModeManager:
             customer_text=customer_text,
             draft_text=draft_text,
             ttl_seconds=self._draft_ttl_seconds,
+            variants=variants,
         )
 
         owner_message = self._render_draft_owner_message(
             customer_name=buf["customer_name"],
             customer_chat_id=buf["customer_chat_id"],
             customer_text=customer_text,
-            draft_text=draft_text,
+            variants=variants,
         )
-        keyboard = self._build_draft_keyboard(draft_id, can_reply=bool(conn.get("can_reply")))
+        keyboard = self._build_draft_keyboard(draft_id, can_reply=bool(conn.get("can_reply")),
+                                              variants=len(variants))
 
         try:
             sent = await self._send(
@@ -607,7 +613,13 @@ class BusinessModeManager:
                 pass
             return True
 
-        if choice == CHOICE_SEND:
+        variant = 1 if choice == CHOICE_SEND else _variant_number(choice)
+        if variant is not None:
+            replies = draft.get("variants") or [draft["draft_text"]]
+            if variant > len(replies):
+                await answer(text="Unknown action.")
+                return True
+            reply = replies[variant - 1]
             if not conn.get("can_reply"):
                 await answer(
                     text=(
@@ -619,7 +631,7 @@ class BusinessModeManager:
             try:
                 await self._send(
                     chat_id=int(draft["customer_chat_id"]),
-                    text=draft["draft_text"],
+                    text=reply,
                     business_connection_id=draft["connection_id"],
                 )
             except Exception as exc:
@@ -628,12 +640,12 @@ class BusinessModeManager:
                 return True
 
             self._db.resolve_telegram_business_draft(
-                draft_id, status="sent", final_sent_text=draft["draft_text"],
+                draft_id, status="sent", final_sent_text=reply, sent_variant=variant,
             )
             await answer(text="✓ Sent")
             try:
                 await edit_message_text(
-                    text=self._render_resolved_message(draft, status="sent"),
+                    text=self._render_resolved_message(draft, status="sent", sent_text=reply),
                     reply_markup=None,
                 )
             except Exception:
@@ -822,19 +834,19 @@ class BusinessModeManager:
 
     @staticmethod
     def _render_draft_owner_message(
-        *, customer_name: str, customer_chat_id: str, customer_text: str, draft_text: str
+        *, customer_name: str, customer_chat_id: str, customer_text: str, variants: List[str]
     ) -> str:
-        """Build the plain-text owner-DM body that carries one draft."""
+        """Build the plain-text owner-DM body that carries one card: the replies numbered like its buttons."""
         return (
             f"💬 {customer_name} wrote:\n"
             f"{_quote_block(customer_text)}\n\n"
-            f"📝 Suggested reply:\n"
-            f"{draft_text}\n\n"
+            f"📝 Suggested replies:\n"
+            f"{_numbered(variants)}\n\n"
             f"Mute this chat: /biz off {customer_chat_id}"
         )
 
     @staticmethod
-    def _render_resolved_message(draft: Dict[str, Any], *, status: str) -> str:
+    def _render_resolved_message(draft: Dict[str, Any], *, status: str, sent_text: Optional[str] = None) -> str:
         """Re-render the owner DM after a button decision."""
         header = {
             "sent": "✓ Sent",
@@ -843,10 +855,12 @@ class BusinessModeManager:
             "expired": "⏰ Expired",
             "awaiting_edit": "✎ Edit",
         }.get(status, status)
+        shown = (f"📝 Sent:\n{sent_text}" if sent_text is not None
+                 else f"📝 Draft was:\n{_numbered(draft.get('variants') or [draft.get('draft_text', '')])}")
         return (
             f"{header}\n\n"
             f"💬 Customer wrote:\n{_quote_block(draft.get('customer_text', ''))}\n\n"
-            f"📝 Draft was:\n{draft.get('draft_text', '')}"
+            f"{shown}"
         )
 
     @staticmethod
@@ -874,26 +888,24 @@ class BusinessModeManager:
         return "\n".join(lines)
 
     @staticmethod
-    def _build_draft_keyboard(draft_id: int, *, can_reply: bool):
-        """Construct the inline keyboard for one draft.
+    def _build_draft_keyboard(draft_id: int, *, can_reply: bool, variants: int = 1):
+        """Construct the inline keyboard for one card: a number button per reply, then Edit and Discard.
 
         Imported lazily so the module is importable when python-telegram-bot
         is missing (matches the lazy-deps pattern used elsewhere in the
         adapter).
         """
         from telegram import InlineKeyboardButton, InlineKeyboardMarkup
-        row = []
+        rows = []
         if can_reply:
-            row.append(InlineKeyboardButton(
-                "✓ Send", callback_data=f"{CALLBACK_PREFIX}{CHOICE_SEND}:{draft_id}",
-            ))
-        row.append(InlineKeyboardButton(
-            "✎ Edit", callback_data=f"{CALLBACK_PREFIX}{CHOICE_EDIT}:{draft_id}",
-        ))
-        row.append(InlineKeyboardButton(
-            "✕ Discard", callback_data=f"{CALLBACK_PREFIX}{CHOICE_DISCARD}:{draft_id}",
-        ))
-        return InlineKeyboardMarkup([row])
+            rows.append([InlineKeyboardButton(
+                str(n), callback_data=f"{CALLBACK_PREFIX}{CHOICE_VARIANT}{n}:{draft_id}",
+            ) for n in range(1, variants + 1)])
+        rows.append([
+            InlineKeyboardButton("✎ Edit", callback_data=f"{CALLBACK_PREFIX}{CHOICE_EDIT}:{draft_id}"),
+            InlineKeyboardButton("✕ Discard", callback_data=f"{CALLBACK_PREFIX}{CHOICE_DISCARD}:{draft_id}"),
+        ])
+        return InlineKeyboardMarkup(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -910,10 +922,16 @@ _PRIVATE_DETAIL = re.compile(r"https?://|www\.|@\w|\S+@\S+\.\w+|\d{3,}")
 
 # Appended to the owner persona to form the drafting system prompt.
 DRAFT_OUTPUT_RULES = (
-    "Output only the message text. No preamble, no quotes, no "
-    "markdown headers. Keep it under 4 sentences unless the "
-    "customer asked something that genuinely needs a longer reply."
+    "Output 2 or 3 alternative replies to the latest message(s), separated by a line containing only ---. "
+    "The owner reads them all and sends one with a single tap, so each reply is a complete message he could "
+    "send as is, and each takes a different decision he might make: for example agree, propose something else, "
+    "or ask what exactly is meant. Because he chooses, a reply may take a decision for him, but never one that "
+    "reverses what he already said above. For a message with nothing to decide, a short reaction and a question "
+    "are good alternatives. Each reply carries one decision and adds no fact, date, amount or commitment that is "
+    "not in the conversation. No numbering, preamble, quotes or markdown. Keep each reply under 4 sentences "
+    "unless the customer asked something that genuinely needs a longer reply."
 )
+_VARIANT_SEPARATOR = re.compile(r"^[ \t]*-{3,}[ \t]*$", re.MULTILINE)
 
 # The owner types on a phone keyboard: typography the model likes never reaches a draft.
 _KEYBOARD_ONLY = str.maketrans({"—": "-", "–": "-", "…": "...", "«": '"', "»": '"', "“": '"', "”": '"'})
@@ -947,6 +965,28 @@ def postprocess_draft(text: Optional[str]) -> Tuple[str, bool]:
     if text.strip(string.punctuation + " ").lower() == "skip":
         return "", True
     return _capitalize_sentences(text), False
+
+def postprocess_variants(text: Optional[str]) -> Tuple[List[str], bool]:
+    """Model output -> (up to MAX_VARIANTS distinct replies, skipped), each block cleaned like a single draft."""
+    if postprocess_draft(text)[1]:
+        return [], True
+    replies: List[str] = []
+    for block in _VARIANT_SEPARATOR.split(text or ""):
+        reply, _ = postprocess_draft(block)  # a SKIP block among replies is dropped
+        if reply and reply not in replies:
+            replies.append(reply)
+    return replies[:MAX_VARIANTS], False
+
+
+def _variant_number(choice: str) -> Optional[int]:
+    """"v2" -> 2; None for anything that is not a variant button."""
+    digits = choice[len(CHOICE_VARIANT):] if choice.startswith(CHOICE_VARIANT) else ""
+    return int(digits) if digits.isdigit() and 1 <= int(digits) <= MAX_VARIANTS else None
+
+
+def _numbered(replies: List[str]) -> str:
+    return "\n\n".join(f"{n}. {r}" for n, r in enumerate(replies, 1))
+
 
 _MEDIA_LABELS = (
     ("photo", "[photo]"), ("voice", "[voice message]"), ("video_note", "[video message]"),

@@ -489,35 +489,12 @@ class TestBusinessMessageDraftFlow:
         assert drafts[0]["draft_text"] == "Hey, thanks for reaching out!"
 
     @pytest.mark.asyncio
-    async def test_no_can_reply_drops_send_button(self, db, monkeypatch):
-        # Capture callback_data passed to InlineKeyboardButton to verify
-        # the Send button is omitted when can_reply is False.  We wrap
-        # _build_draft_keyboard so we can inspect the choices it produced
-        # — the underlying telegram mock makes the resulting keyboard
-        # object opaque.
-        from telegram_business_plugin import manager as biz_mod
-
-        original = biz_mod.BusinessModeManager._build_draft_keyboard
-        captured: List[str] = []
-
-        def _spy(draft_id, *, can_reply):
-            if can_reply:
-                captured.append("send")
-            captured.append("edit")
-            captured.append("discard")
-            return original(draft_id, can_reply=can_reply)
-
-        monkeypatch.setattr(
-            biz_mod.BusinessModeManager,
-            "_build_draft_keyboard",
-            staticmethod(_spy),
-        )
-
-        mgr, sender = _make_manager(db)
+    async def test_no_can_reply_drops_the_number_buttons(self, db):
+        mgr, sender = _make_manager(db, draft_text="Yes\n---\nMonday?")
         await mgr.handle_connection_update(_fake_business_connection(can_reply=False))
         sender.calls.clear()
         await mgr.handle_business_message(_fake_business_message())
-        assert captured == ["edit", "discard"]
+        assert _buttons(sender.calls[0]["reply_markup"]) == [["✎ Edit", "✕ Discard"]]
 
     @pytest.mark.asyncio
     async def test_unknown_connection_silently_ignored(self, db):
@@ -582,6 +559,126 @@ class TestBusinessMessageDraftFlow:
         # Only one draft should have been generated and one owner DM sent.
         owner_dms = [c for c in sender.calls if c.get("chat_id") == 100]
         assert len(owner_dms) == 1
+
+
+def _buttons(markup):
+    return [[b.text for b in row] for row in markup.inline_keyboard]
+
+
+async def _tap(mgr, data, caller="42"):
+    answered, edited = [], []
+
+    async def _answer(**kw): answered.append(kw)
+    async def _edit(**kw): edited.append(kw)
+
+    await mgr.handle_callback(data=data, caller_user_id=caller, answer=_answer, edit_message_text=_edit)
+    return answered, edited
+
+
+class TestDecisionVariants:
+    THREE = "да, скину в пятницу\n---\nМожет, в понедельник?\n  ---  \nКакой именно счёт?"
+
+    @pytest.mark.asyncio
+    async def test_three_blocks_give_three_numbered_replies_and_buttons(self, db):
+        """Covers AE1."""
+        mgr, sender = _make_manager(db, draft_text=self.THREE)
+        await mgr.handle_connection_update(_fake_business_connection())
+        sender.calls.clear()
+        await mgr.handle_business_message(_fake_business_message(text="Скинешь счёт до пятницы?"))
+        card = sender.calls[0]
+        assert "1. Да, скину в пятницу" in card["text"]
+        assert "2. Может, в понедельник?" in card["text"]
+        assert "3. Какой именно счёт?" in card["text"]
+        assert _buttons(card["reply_markup"]) == [["1", "2", "3"], ["✎ Edit", "✕ Discard"]]
+        row = db.get_pending_telegram_business_drafts_for_owner("100")[0]
+        assert db.get_telegram_business_draft(row["draft_id"])["variants"] == [
+            "Да, скину в пятницу", "Может, в понедельник?", "Какой именно счёт?"]
+        assert row["draft_text"] == "Да, скину в пятницу"
+
+    @pytest.mark.asyncio
+    async def test_nothing_to_decide_still_gets_a_card(self, db):
+        """Covers AE2."""
+        mgr, sender = _make_manager(db, draft_text="Ура!\n---\nКак долетела?")
+        await mgr.handle_connection_update(_fake_business_connection())
+        sender.calls.clear()
+        await mgr.handle_business_message(_fake_business_message(text="Прилетела"))
+        assert _buttons(sender.calls[0]["reply_markup"])[0] == ["1", "2"]
+
+    @pytest.mark.asyncio
+    async def test_one_block_gives_one_reply_and_one_button(self, db):
+        mgr, sender = _make_manager(db, draft_text="Ок")
+        await mgr.handle_connection_update(_fake_business_connection())
+        sender.calls.clear()
+        await mgr.handle_business_message(_fake_business_message())
+        assert _buttons(sender.calls[0]["reply_markup"])[0] == ["1"]
+
+    @pytest.mark.asyncio
+    async def test_each_block_is_post_processed(self, db):
+        mgr, sender = _make_manager(db, draft_text="первый — да\n---\nвторой… нет")
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message())
+        did = db.get_pending_telegram_business_drafts_for_owner("100")[0]["draft_id"]
+        assert db.get_telegram_business_draft(did)["variants"] == ["Первый - да", "Второй... нет"]
+
+    @pytest.mark.asyncio
+    async def test_skip_still_sends_no_card(self, db):
+        mgr, sender = _make_manager(db, draft_text="SKIP")
+        await mgr.handle_connection_update(_fake_business_connection())
+        sender.calls.clear()
+        await mgr.handle_business_message(_fake_business_message())
+        assert sender.calls == []
+
+    @pytest.mark.asyncio
+    async def test_tapping_two_sends_the_second_reply(self, db):
+        mgr, sender = _make_manager(db, draft_text=self.THREE)
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message())
+        did = db.get_pending_telegram_business_drafts_for_owner("100")[0]["draft_id"]
+        sender.calls.clear()
+        answered, edited = await _tap(mgr, f"bd:v2:{did}")
+        to_contact = [c for c in sender.calls if c.get("chat_id") == 200]
+        assert [(c["text"], c["business_connection_id"]) for c in to_contact] == [("Может, в понедельник?", "conn1")]
+        row = db.get_telegram_business_draft(did)
+        assert (row["status"], row["sent_variant"], row["final_sent_text"]) == ("sent", 2, "Может, в понедельник?")
+        assert "Может, в понедельник?" in edited[0]["text"]
+
+    @pytest.mark.asyncio
+    async def test_send_button_of_a_card_from_before_the_update_sends_the_first_reply(self, db):
+        mgr, sender = _make_manager(db, draft_text=self.THREE)
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message())
+        did = db.get_pending_telegram_business_drafts_for_owner("100")[0]["draft_id"]
+        sender.calls.clear()
+        await _tap(mgr, f"bd:send:{did}")
+        assert [c["text"] for c in sender.calls if c.get("chat_id") == 200] == ["Да, скину в пятницу"]
+        assert db.get_telegram_business_draft(did)["sent_variant"] == 1
+
+    @pytest.mark.asyncio
+    async def test_a_number_past_the_last_reply_sends_nothing(self, db):
+        mgr, sender = _make_manager(db, draft_text="Да\n---\nНет")
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message())
+        did = db.get_pending_telegram_business_drafts_for_owner("100")[0]["draft_id"]
+        sender.calls.clear()
+        await _tap(mgr, f"bd:v3:{did}")
+        assert not [c for c in sender.calls if c.get("chat_id") == 200]
+        assert db.get_telegram_business_draft(did)["status"] == "pending"
+
+    @pytest.mark.asyncio
+    async def test_a_number_tap_from_someone_else_is_refused(self, db):
+        mgr, sender = _make_manager(db, draft_text=self.THREE)
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message())
+        did = db.get_pending_telegram_business_drafts_for_owner("100")[0]["draft_id"]
+        sender.calls.clear()
+        answered, _ = await _tap(mgr, f"bd:v1:{did}", caller="9999")
+        assert "Only the connected account owner" in answered[0]["text"]
+        assert not [c for c in sender.calls if c.get("chat_id") == 200]
+
+    def test_callback_data_fits_telegram_limit(self):
+        from telegram_business_plugin.manager import BusinessModeManager
+        markup = BusinessModeManager._build_draft_keyboard(2**63 - 1, can_reply=True, variants=3)
+        assert all(len(b.callback_data.encode()) <= 64 for row in markup.inline_keyboard for b in row)
 
 
 class TestCallbackDispatch:
@@ -1119,7 +1216,7 @@ async def test_biz_status_shows_persona_source(db):
 def test_draft_dm_shows_mute_command():
     from telegram_business_plugin.manager import BusinessModeManager
     body = BusinessModeManager._render_draft_owner_message(
-        customer_name="Ann", customer_chat_id="777", customer_text="hi", draft_text="hello")
+        customer_name="Ann", customer_chat_id="777", customer_text="hi", variants=["hello"])
     assert body.endswith("Mute this chat: /biz off 777")
 
 

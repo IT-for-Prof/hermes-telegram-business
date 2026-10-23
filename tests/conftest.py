@@ -20,8 +20,10 @@ def _ensure_telegram_stub() -> None:
     if "telegram" in sys.modules:
         return
     telegram = types.ModuleType("telegram")
-    telegram.InlineKeyboardButton = MagicMock(name="InlineKeyboardButton")
-    telegram.InlineKeyboardMarkup = MagicMock(name="InlineKeyboardMarkup")
+    # Plain records, so tests can read the rendered keyboard.
+    telegram.InlineKeyboardButton = lambda text, callback_data: types.SimpleNamespace(
+        text=text, callback_data=callback_data)
+    telegram.InlineKeyboardMarkup = lambda rows: types.SimpleNamespace(inline_keyboard=rows)
     ext = types.ModuleType("telegram.ext")
 
     class ApplicationHandlerStop(Exception):
