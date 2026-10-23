@@ -900,6 +900,33 @@ class TestGistFromTheBotDm:
         assert (await mgr.reply_from_dm(contact="202", gist="да"))["contact"] == "Ivan Sidorov"
 
 
+class TestGistFromTheDigest:
+    @pytest.mark.asyncio
+    async def test_digest_button_starts_a_gist_for_that_chat(self, db):
+        mgr, sender = _make_manager(db, replies=["Да, в пятницу."])
+        await mgr.handle_connection_update(_fake_business_connection())
+        db.set_telegram_business_auto_draft("conn1", auto_draft=False)
+        await mgr.handle_business_message(_fake_business_message(text="Скинешь счёт?"))
+        sender.calls.clear()
+        answered, _ = await _tap(mgr, "bd:gc:200")
+        assert "Суть для Customer Carol?" in sender.calls[-1]["text"]
+        await mgr.maybe_handle_edit_capture(owner_chat_id="100", text="да, в пятницу")
+        rows = db.get_pending_telegram_business_drafts_for_owner("100")
+        assert [(r["origin"], r["gist"]) for r in rows] == [("gist_digest", "да, в пятницу")]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("data,caller", [("bd:gc:999", "42"), ("bd:gc:200", "9999")])
+    async def test_unknown_chat_or_stranger_gets_chat_not_found(self, db, data, caller):
+        mgr, sender = _make_manager(db)
+        await mgr.handle_connection_update(_fake_business_connection())
+        db.set_telegram_business_auto_draft("conn1", auto_draft=False)
+        await mgr.handle_business_message(_fake_business_message())
+        sender.calls.clear()
+        answered, _ = await _tap(mgr, data, caller=caller)
+        assert "не найден" in answered[0]["text"] and sender.calls == []
+        assert await mgr.maybe_handle_edit_capture(owner_chat_id="100", text="hi agent") is False
+
+
 class TestCallbackDispatch:
     @pytest.mark.asyncio
     async def test_send_button_delivers_to_customer_chat(self, db):

@@ -68,6 +68,7 @@ CHOICE_EDIT = "edit"
 CHOICE_DISCARD = "discard"
 CHOICE_GIST = "gist"      # "✍ Своя суть": the owner's next text or voice note becomes a reply preview
 CHOICE_CANCEL = "cancel"  # drops a waiting gist; its draft id slot is unused (0)
+CHOICE_DIGEST_GIST = "gc"  # a digest button: "bd:gc:<customer_chat_id>" starts a gist for that chat
 MAX_VARIANTS = 3
 REPLY_WINDOW_S = 24 * 3600  # Telegram lets a Business bot reply only within a day of the contact's last message
 
@@ -572,6 +573,8 @@ class BusinessModeManager:
         choice = parts[1]
         if choice == CHOICE_CANCEL:
             return await self._cancel_gist(caller_user_id, answer, edit_message_text)
+        if choice == CHOICE_DIGEST_GIST:
+            return await self._gist_from_digest(caller_user_id, parts[2], answer)
         try:
             draft_id = int(parts[2])
         except ValueError:
@@ -889,6 +892,23 @@ class BusinessModeManager:
             text=f"✍ Суть для {self._contact_name(conn, customer_chat_id)}? Напишите или скажите.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
                 "Отмена", callback_data=f"{CALLBACK_PREFIX}{CHOICE_CANCEL}:0")]]))
+
+    async def _gist_from_digest(self, caller_user_id: Optional[str], customer_chat_id: str,
+                                answer: Callable[..., Awaitable[Any]]) -> bool:
+        # find_chats is scoped to the caller's own connections: anyone else finds nothing
+        found = [c for c in self._db.find_chats(str(caller_user_id), customer_chat_id)
+                 if c["customer_chat_id"] == customer_chat_id]
+        conn = self._db.get_telegram_business_connection(found[0]["connection_id"]) if found else None
+        if not conn:
+            await answer(text="Чат не найден")
+            return True
+        owner_chat = str(conn["owner_chat_id"])
+        self._edit_capture.pop(owner_chat, None)
+        self._gist_capture[owner_chat] = {"conn_id": conn["connection_id"], "chat_id": customer_chat_id,
+                                          "origin": "gist_digest", "card_id": None}
+        await answer(text="✍ Жду суть")
+        await self._ask_for_gist(owner_chat, conn, customer_chat_id)
+        return True
 
     async def _cancel_gist(self, caller_user_id: Optional[str], answer: Callable[..., Awaitable[Any]],
                            edit_message_text: Callable[..., Awaitable[Any]]) -> bool:
