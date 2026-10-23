@@ -919,12 +919,34 @@ DRAFT_OUTPUT_RULES = (
 _KEYBOARD_ONLY = str.maketrans({"—": "-", "–": "-", "…": "...", "«": '"', "»": '"', "“": '"', "”": '"'})
 
 
+# A dot after one of these (or after a single letter other than "я", "т. е.") ends an abbreviation, not a sentence.
+_ABBREVIATIONS = frozenset("т.е т.д т.п т.к т.н т.ч гг ул кв руб коп тыс млн млрд мин сек см мм км кг др пр им ст "
+                           "стр обл напр прим св".split())
+_SENTENCE_START = re.compile(r"(^|\n[ \t]*|(?<!\.\.)[.!?][ \t]+)([^\s.!?,;:]+)")
+
+
+def _capitalize_sentences(text: str) -> str:
+    """Capital letter at the start of the draft, of each line and after . ! ? (owner's request: drafts follow
+    Russian spelling even where he writes in lowercase). Leaves links, handles, ids like iPhone and "..."."""
+    def up(m: "re.Match[str]") -> str:
+        lead, word = m.group(1), m.group(2)
+        token = text[m.start(2):].split(None, 1)[0].rstrip(".,!?;:)")
+        if not word[0].islower() or re.search(r"[A-ZА-ЯЁ\d@/:.]", token[1:]):
+            return m.group(0)
+        if lead.startswith("."):
+            before = text[:m.start()].rsplit(None, 1)[-1].lower() if text[:m.start()].strip() else ""
+            if (len(before) == 1 and before != "я") or before in _ABBREVIATIONS:
+                return m.group(0)
+        return lead + word[0].upper() + word[1:]
+    return _SENTENCE_START.sub(up, text)
+
+
 def postprocess_draft(text: Optional[str]) -> Tuple[str, bool]:
     """Model output -> (draft text, skipped). ``SKIP`` (any case/punctuation) means no reply is needed."""
     text = (text or "").strip().translate(_KEYBOARD_ONLY)
     if text.strip(string.punctuation + " ").lower() == "skip":
         return "", True
-    return text, False
+    return _capitalize_sentences(text), False
 
 _MEDIA_LABELS = (
     ("photo", "[photo]"), ("voice", "[voice message]"), ("video_note", "[video message]"),

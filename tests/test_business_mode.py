@@ -455,7 +455,7 @@ class TestBusinessMessageDraftFlow:
 class TestCallbackDispatch:
     @pytest.mark.asyncio
     async def test_send_button_delivers_to_customer_chat(self, db):
-        mgr, sender = _make_manager(db, draft_text="hello there")
+        mgr, sender = _make_manager(db, draft_text="Hello there")
         await mgr.handle_connection_update(_fake_business_connection())
         await mgr.handle_business_message(_fake_business_message())
         sender.calls.clear()
@@ -479,11 +479,11 @@ class TestCallbackDispatch:
         ]
         assert sends_to_customer
         assert sends_to_customer[0]["business_connection_id"] == "conn1"
-        assert sends_to_customer[0]["text"] == "hello there"
+        assert sends_to_customer[0]["text"] == "Hello there"
         # Draft now sent
         row = db.get_telegram_business_draft(did)
         assert row["status"] == "sent"
-        assert row["final_sent_text"] == "hello there"
+        assert row["final_sent_text"] == "Hello there"
         # Owner DM was edited to show resolution
         assert edited and "Sent" in edited[0]["text"]
 
@@ -1124,6 +1124,21 @@ class TestDraftOutputCleanup:
         draft = db.get_pending_telegram_business_drafts_for_owner("100")[0]
         assert draft["draft_text"] == 'Ок - завтра... "да" "нет" - ладно'
 
+    @pytest.mark.parametrize("raw, expected", [
+        ("привет, норм. да, печально", "Привет, норм. Да, печально"),
+        ("Иван, добрый день! удобно сейчас созвониться?", "Иван, добрый день! Удобно сейчас созвониться?"),
+        ("ок\nзавтра гляну", "Ок\nЗавтра гляну"),
+        ("это т.е. так, 100 руб. за штуку", "Это т.е. так, 100 руб. за штуку"),
+        ("т. е. завтра", "Т. е. завтра"),
+        ("ну... ладно", "Ну... ладно"),
+        ("это я. потом", "Это я. Потом"),
+        ("iPhone взял. https://example.com/x глянь", "iPhone взял. https://example.com/x глянь"),
+        ("@ivan скинь. vaultwarden гляну", "@ivan скинь. Vaultwarden гляну"),
+    ])
+    def test_sentences_start_with_a_capital(self, raw, expected):
+        from telegram_business_plugin.manager import postprocess_draft
+        assert postprocess_draft(raw) == (expected, False)
+
     @pytest.mark.parametrize("output", ["SKIP", "skip.", " Skip ", "SKIP!"])
     @pytest.mark.asyncio
     async def test_skip_records_row_without_dm(self, db, output):
@@ -1145,7 +1160,7 @@ class TestDraftOutputCleanup:
         pending = db.get_pending_telegram_business_drafts_for_owner("100")
         assert [d["customer_text"] for d in pending] == ["Free on Friday?"]
 
-    @pytest.mark.parametrize("text", ["Skip it, I'll call", "skipping today"])
+    @pytest.mark.parametrize("text", ["Skip it, I'll call", "Skipping today"])
     @pytest.mark.asyncio
     async def test_text_mentioning_skip_is_a_normal_draft(self, db, text):
         mgr, sender = _make_manager(db, draft_text=text)
