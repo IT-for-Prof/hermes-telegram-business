@@ -1151,17 +1151,25 @@ DRAFT_OUTPUT_RULES = (
     "latest message(s), separated by a line containing only ---. The owner reads them all and sends one with a single tap, so each reply is a complete message he could "
     "send as is, and each takes a different decision he might make: for example agree, propose something else, "
     "or ask what exactly is meant. Because he picks one, a reply may take a decision for him (the choice stays "
-    "his), but never one that reverses what he already said above. For a message with nothing to decide, a short reaction and a question "
-    "are good alternatives. Each reply carries one decision and adds no fact, date, amount or commitment that is "
-    "not in the conversation. No numbering, preamble, quotes or markdown. Keep each reply under 4 sentences "
-    "unless the customer asked something that genuinely needs a longer reply."
+    "his), but never one that reverses what he already said above. Two replies that say the same thing in other "
+    "words are one decision: when the message leaves one obvious answer, make the other replies a clarifying "
+    "question or a holding reply instead of rewording it. For a message with nothing to decide, a short reaction "
+    "and a question are good alternatives. Each reply carries one decision and adds no fact, date, amount or "
+    "commitment that is not in the conversation. Each reply follows the spelling rules above (commas, ё, capital "
+    "letters) as strictly as a single draft would. No numbering, preamble, quotes or markdown. Keep each reply "
+    "under 4 sentences unless the customer asked something that genuinely needs a longer reply."
 )
 # The system prompt's rules for a reply worded from the owner's gist (instead of DRAFT_OUTPUT_RULES).
 GIST_OUTPUT_RULES = (
     "Output one reply: the message the owner will send, written from his gist in his style. Keep every fact, "
     "date, amount and decision of the gist exactly as he gave it, and add none that is not in the gist or the "
-    "conversation. Output only the message text: no preamble, quotes, markdown, alternatives or ---. Keep it "
-    "under 4 sentences unless the gist itself is longer."
+    "conversation. Keep the gist's form: a question to the contact stays a question (\"сказать, что в "
+    "понедельник?\" is asked, not answered), a statement stays a statement, and names of things stay as he wrote "
+    "them. A gist that is only an emoji or a single word like \"ок\" is sent as it is. The gist may come from "
+    "voice recognition: where a part makes no sense, leave it out rather than guess, and never fill the gap with "
+    "a promise or a time of your own. Follow the spelling rules above (commas, ё, capital letters). Output only "
+    "the message text: no preamble, quotes, markdown, alternatives or ---. Keep it under 4 sentences unless the "
+    "gist itself is longer."
 )
 _VARIANT_SEPARATOR = re.compile(r"^[ \t]*-{3,}[ \t]*$", re.MULTILINE)
 
