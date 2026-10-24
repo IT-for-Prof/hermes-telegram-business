@@ -32,7 +32,7 @@ import logging
 import os
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 try:  # Normal package import (Hermes plugin loader, tests via conftest alias)
     from .manager import BusinessModeManager, CALLBACK_PREFIX, DRAFT_OUTPUT_RULES, GIST_OUTPUT_RULES
@@ -116,7 +116,8 @@ async def _transcribe_voice(message: Any) -> str:
     return result["transcript"].strip()
 
 
-_CONFIG_KEYS = ("debounce_seconds", "draft_ttl_hours", "max_customer_text_chars", "owner_persona")
+_CONFIG_KEYS = ("debounce_seconds", "draft_ttl_hours", "max_customer_text_chars", "owner_persona",
+                "allowed_owner_ids")
 
 
 def _plugin_config(ctx: Any) -> dict:
@@ -132,6 +133,7 @@ def _plugin_config(ctx: Any) -> dict:
                 draft_ttl_hours: 24
                 max_customer_text_chars: 4000
                 owner_persona: "..."
+                allowed_owner_ids: [123456789]   # Telegram user ids whose Business accounts may connect
 
     The legacy flat layout (keys directly under ``telegram-business``) still
     works; ``settings`` wins per key. Never parse config.yaml ourselves: PyYAML is
@@ -189,6 +191,14 @@ SECRETARY_TOOL_SCHEMA = {
 _TOOL_TIMEOUT_S = 120.0  # wording the gist is one model call; the preview send may wait for a reconnecting bot
 
 
+def _owner_ids(value: Any) -> Optional[frozenset]:
+    """``allowed_owner_ids`` as a set of id strings: a list, one number or a comma-separated string; None if unset."""
+    if value is None or value == "":
+        return None
+    items = value if isinstance(value, (list, tuple, set)) else str(value).split(",")
+    return frozenset(str(i).strip() for i in items if str(i).strip())
+
+
 def _task_defaults(tag: str) -> dict:
     # Reasoning off: Qwen thinks by default and spent ~1.8k output tokens per draft; the replay eval showed the
     # same style, commas and ё without it (2026-10-23). The tag lets Langfuse sum each task's spend.
@@ -212,6 +222,9 @@ def register(ctx: Any) -> None:
     persona = str(custom_persona or _DEFAULT_PERSONA)
     persona_source = f"{'config' if custom_persona else 'BUILT-IN DEFAULT'}, {len(persona)} chars"
     logger.info("telegram-business: persona from %s", persona_source)
+    allowed_owner_ids = _owner_ids(cfg.get("allowed_owner_ids"))
+    if allowed_owner_ids is None:
+        logger.warning("telegram-business: allowed_owner_ids not set, any Business account may connect the bot")
 
     # Deferred singletons — constructed on first connect so import stays light.
     _state: dict = {"db": None, "manager": None, "adapter": None, "loop": None}
@@ -285,6 +298,7 @@ def register(ctx: Any) -> None:
             persona_source=persona_source,
             memory=memory,
             edit_markup=lambda **kw: _bot_call(_state, "edit_message_reply_markup", **kw),
+            allowed_owner_ids=allowed_owner_ids,
         )
         return _state["manager"]
 

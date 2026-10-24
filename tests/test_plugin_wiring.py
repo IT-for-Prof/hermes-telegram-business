@@ -310,3 +310,19 @@ async def test_secretary_reply_timeout_cancels_and_reports_failure(tmp_path, mon
     assert json.loads(result)["status"] == "failed"
     await asyncio.sleep(0.05)
     assert finished == []                               # cancelled: no late preview
+
+
+@pytest.mark.parametrize("value, expected", [
+    ([448184303], frozenset({"448184303"})),
+    ("448184303, 12", frozenset({"448184303", "12"})),
+    (448184303, frozenset({"448184303"})),
+    (None, None),
+])
+def test_allowed_owner_ids_from_settings(tmp_path, monkeypatch, value, expected):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    ctx = _FakeCtx()
+    ctx.get_config = lambda key: value if key == "allowed_owner_ids" else None
+    plugin.register(ctx)
+    application = MagicMock()
+    ctx.factories[0](application, SimpleNamespace(_bot=MagicMock(), name="telegram"))
+    assert _manager(application)._allowed_owner_ids == expected

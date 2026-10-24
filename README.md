@@ -34,6 +34,7 @@ The gist also works without a card: tell the Hermes agent in the bot DM "Carol: 
 
 - **No auto-send exists.** Every reply requires an owner button tap, even when `can_reply` is granted.
 - **Owner-only buttons.** Callbacks are authorized against the connection's `owner_user_id`; anyone else gets `⛔`.
+- **Owner-only connections (`allowed_owner_ids`).** Any Telegram Premium user who knows the bot's name can add it as their chatbot; without this setting every such connection is served on your model. With it, other accounts are refused and logged.
 - **Drafts expire after 24h** (configurable). Stale buttons no-op.
 - **Without `can_reply`, the number buttons are hidden** — you're told to copy/paste manually instead of getting a button that silently fails.
 - **Typing bursts coalesce** — messages within the debounce window accumulate into one draft (an edit replaces its part), one draft per coherent thought.
@@ -82,6 +83,7 @@ plugins:
         debounce_seconds: 8        # coalesce typing bursts
         draft_ttl_hours: 24        # stale-draft expiry
         max_customer_text_chars: 4000
+        allowed_owner_ids: [123456789]   # your Telegram user id; other Business accounts are refused
         owner_persona: >
           You are drafting replies for a freelance photographer.
           Friendly, brief, always suggest a concrete next step.

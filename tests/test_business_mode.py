@@ -485,6 +485,50 @@ class TestConnectionLifecycle:
         assert "OFF" in sender.calls[0]["text"]
 
 
+class TestAllowedOwners:
+    @staticmethod
+    def _manager(db, allowed):
+        from telegram_business_plugin.manager import BusinessModeManager
+        sender = _SentRecorder()
+
+        async def _draft(prompt, chat_id, rules=None):
+            sender.generated.append(prompt)
+            return "Ок"
+
+        return BusinessModeManager(session_db=db, send_message=sender, draft_generator=_draft, debounce_seconds=0,
+                                   allowed_owner_ids=allowed), sender
+
+    @pytest.mark.asyncio
+    async def test_a_stranger_s_connection_is_refused_and_stored_nowhere(self, db):
+        mgr, sender = self._manager(db, frozenset({"42"}))
+        await mgr.handle_connection_update(_fake_business_connection(conn_id="evil", owner_id=777, owner_chat=777))
+        assert db.get_telegram_business_connection("evil") is None
+        assert sender.calls == []                          # no onboarding DM to the stranger
+        await mgr.handle_business_message(_fake_business_message(conn_id="evil"))
+        assert sender.generated == []                      # no model call on the owner's key
+
+    @pytest.mark.asyncio
+    async def test_the_owner_s_connection_works(self, db):
+        mgr, sender = self._manager(db, frozenset({"42"}))
+        await mgr.handle_connection_update(_fake_business_connection())
+        await mgr.handle_business_message(_fake_business_message())
+        assert db.get_telegram_business_connection("conn1") is not None and sender.generated
+
+    @pytest.mark.asyncio
+    async def test_a_stranger_row_stored_before_the_setting_is_ignored(self, db):
+        open_mgr, _ = self._manager(db, None)
+        await open_mgr.handle_connection_update(_fake_business_connection(conn_id="evil", owner_id=777, owner_chat=777))
+        mgr, sender = self._manager(db, frozenset({"42"}))
+        await mgr.handle_business_message(_fake_business_message(conn_id="evil"))
+        assert sender.generated == [] and db.get_business_chat_log("evil", "200") == []
+
+    @pytest.mark.asyncio
+    async def test_without_the_setting_every_connection_is_accepted(self, db):
+        mgr, _ = self._manager(db, None)
+        await mgr.handle_connection_update(_fake_business_connection(conn_id="any", owner_id=777, owner_chat=777))
+        assert db.get_telegram_business_connection("any") is not None
+
+
 class TestBusinessMessageDraftFlow:
     @pytest.mark.asyncio
     async def test_incoming_customer_message_drafts_and_dms_owner(self, db):

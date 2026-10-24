@@ -136,7 +136,11 @@ class BusinessModeManager:
         persona_source: str = "",
         memory: Any = None,
         edit_markup: Optional[Callable[..., Awaitable[Any]]] = None,
+        allowed_owner_ids: Optional[frozenset] = None,
     ) -> None:
+        # Telegram user ids whose Business accounts may connect; None accepts anyone. Any Premium user who knows
+        # the bot's name can add it as their chatbot, and every draft for them would run on the owner's model.
+        self._allowed_owner_ids = allowed_owner_ids
         self._persona_source = persona_source  # shown in /biz status
         self._memory = memory                  # optional ContactMemory (memory.py); None = no Honcho
         self._memory_tasks: set = set()
@@ -184,6 +188,10 @@ class BusinessModeManager:
                 "BusinessConnection update missing required fields: id=%s, user.id=%s, user_chat_id=%s",
                 conn_id, owner_user_id, owner_chat_id,
             )
+            return
+        if not self._owner_allowed(owner_user_id):
+            logger.warning("Refusing Business connection %s from user %s: not in allowed_owner_ids",
+                           conn_id, owner_user_id)
             return
 
         # ``can_reply`` location moved in API 9.0 from connection root to
@@ -270,7 +278,7 @@ class BusinessModeManager:
         if not conn:
             logger.debug("Received business_message for unknown connection %s", conn_id)
             return
-        if not conn.get("is_enabled"):
+        if not conn.get("is_enabled") or not self._owner_allowed(conn.get("owner_user_id")):
             return
 
         chat = getattr(message, "chat", None)
@@ -335,6 +343,9 @@ class BusinessModeManager:
             self._debounce_tasks[key] = asyncio.create_task(
                 self._debounce_then_draft(key)
             )
+
+    def _owner_allowed(self, owner_user_id: Any) -> bool:
+        return self._allowed_owner_ids is None or str(owner_user_id) in self._allowed_owner_ids
 
     def _drop_queued_draft(self, key: str, conn_id: str, customer_chat_id: str,
                            owner_text: Optional[str] = None) -> None:
