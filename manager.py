@@ -1155,8 +1155,9 @@ DRAFT_OUTPUT_RULES = (
     "words are one decision: when the message leaves one obvious answer, make the other replies a clarifying "
     "question or a holding reply instead of rewording it. For a message with nothing to decide, a short reaction "
     "and a question are good alternatives. Each reply carries one decision and adds no fact, date, amount or "
-    "commitment that is not in the conversation. Each reply follows the spelling rules above (commas, ё, capital "
-    "letters) as strictly as a single draft would. No numbering, preamble, quotes or markdown. Keep each reply "
+    "commitment that is not in the conversation. Each reply follows the spelling rules above as strictly as a "
+    "single draft would: commas around introductory words (может, возможно, наверное, конечно, кстати, видимо, "
+    "получается, если что) and before что, чтобы, если, когда, а, но; ё where it belongs. No numbering, preamble, quotes or markdown. Keep each reply "
     "under 4 sentences unless the customer asked something that genuinely needs a longer reply."
 )
 # The system prompt's rules for a reply worded from the owner's gist (instead of DRAFT_OUTPUT_RULES).
@@ -1167,7 +1168,9 @@ GIST_OUTPUT_RULES = (
     "понедельник?\" is asked, not answered), a statement stays a statement, and names of things stay as he wrote "
     "them. A gist that is only an emoji or a single word like \"ок\" is sent as it is. The gist may come from "
     "voice recognition: where a part makes no sense, leave it out rather than guess, and never fill the gap with "
-    "a promise or a time of your own. Follow the spelling rules above (commas, ё, capital letters). Output only "
+    "a promise or a time of your own. Keep his answer words: a \"да\" or \"конечно\" that answers a question stays an "
+    "answer. Follow the spelling rules above: commas around introductory words (может, возможно, наверное, "
+    "конечно, видимо, если что) and before что, чтобы, если, когда, а, но; ё where it belongs. Output only "
     "the message text: no preamble, quotes, markdown, alternatives or ---. Keep it under 4 sentences unless the "
     "gist itself is longer."
 )
