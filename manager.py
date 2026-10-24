@@ -1202,12 +1202,18 @@ def _capitalize_sentences(text: str) -> str:
     return _SENTENCE_START.sub(up, text)
 
 
-# A comma before чтобы / когда / если opening a clause, the comma the drafts miss most (blind read, 2026-10-24).
-# Not after a word that already joins or limits the clause ("и когда", "даже когда", "для того чтобы").
-# "пока" and "как" are left alone: "оставь пока у себя", "как обычно".
-_CLAUSE_START = re.compile(r"(\S+)([ \t]+)(чтобы|когда|если)\b", re.IGNORECASE)
+# The commas the drafts miss most (blind reads, 2026-10-24): before a clause opened by чтобы / когда / если /
+# что / как, and around the introductory words below. Not after a word that already joins or limits the clause
+# ("и когда", "даже когда", "для того чтобы", "так что", "потому что"); "пока" is left alone ("оставь пока у себя").
+_CLAUSE_START = re.compile(r"(\S+)([ \t]+)(чтобы|когда|если|что|как)(?![\w-])(?![ \t]+(?:раз|минимум|максимум|бы)\b)",
+                           re.IGNORECASE)
 _JOINS_CLAUSE = frozenset("и а но или да ни либо что чем даже только лишь особенно именно вот тогда того потом "
-                          "ещё еще уже ну так".split())
+                          "ещё еще уже ну так потому оттого затем несмотря то это всё все такой такая такое такие "
+                          "тот та те же звучит выглядит смотря типа вроде будто на в во за о об про при с со к ко по "
+                          "до от из для без через над под между".split())
+_INTRODUCTORY = re.compile(r"(^|[.!?\n,][ \t]*|(?<=\w)[ \t]+)(конечно|видимо|наверное|кстати)(?=[ \t]+\w)",
+                           re.IGNORECASE)
+_MAYBE_AT_START = re.compile(r"(^|[.!?\n][ \t]*)(может)(?=[ \t]+(?!быть\b|ли\b)\w)", re.IGNORECASE)
 
 
 def _add_clause_commas(text: str) -> str:
@@ -1216,10 +1222,19 @@ def _add_clause_commas(text: str) -> str:
         if not word[-1].isalnum() or word.casefold() in _JOINS_CLAUSE:
             return m.group(0)
         rest = re.match(r"[^.!?\n]*[.!?]?", text[m.end():]).group(0)
-        if m.group(3).casefold() == "когда" and rest.endswith("?"):
-            return m.group(0)  # a direct question: "а второй когда будет готов?"
+        if m.group(3).casefold() in {"когда", "что", "как"} and rest.endswith("?"):
+            return m.group(0)  # a direct question: "а второй когда будет готов?", "ты как там?"
         return f"{word},{m.group(2)}{m.group(3)}"
-    return _CLAUSE_START.sub(comma, text)
+
+    def introductory(m: "re.Match[str]") -> str:
+        lead = m.group(1)
+        if lead and not lead.strip():  # after a word: "снэпшот конечно нужен"
+            lead = "," + lead
+        return f"{lead}{m.group(2)},"
+
+    text = _CLAUSE_START.sub(comma, text)
+    text = _INTRODUCTORY.sub(introductory, text)
+    return _MAYBE_AT_START.sub(lambda m: f"{m.group(1)}{m.group(2)},", text)
 
 
 def postprocess_draft(text: Optional[str]) -> Tuple[str, bool]:
