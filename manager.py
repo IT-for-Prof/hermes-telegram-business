@@ -1202,12 +1202,32 @@ def _capitalize_sentences(text: str) -> str:
     return _SENTENCE_START.sub(up, text)
 
 
+# A comma before чтобы / когда / если opening a clause, the comma the drafts miss most (blind read, 2026-10-24).
+# Not after a word that already joins or limits the clause ("и когда", "даже когда", "для того чтобы").
+# "пока" and "как" are left alone: "оставь пока у себя", "как обычно".
+_CLAUSE_START = re.compile(r"(\S+)([ \t]+)(чтобы|когда|если)\b", re.IGNORECASE)
+_JOINS_CLAUSE = frozenset("и а но или да ни либо что чем даже только лишь особенно именно вот тогда того потом "
+                          "ещё еще уже ну так".split())
+
+
+def _add_clause_commas(text: str) -> str:
+    def comma(m: "re.Match[str]") -> str:
+        word = m.group(1)
+        if not word[-1].isalnum() or word.casefold() in _JOINS_CLAUSE:
+            return m.group(0)
+        rest = re.match(r"[^.!?\n]*[.!?]?", text[m.end():]).group(0)
+        if m.group(3).casefold() == "когда" and rest.endswith("?"):
+            return m.group(0)  # a direct question: "а второй когда будет готов?"
+        return f"{word},{m.group(2)}{m.group(3)}"
+    return _CLAUSE_START.sub(comma, text)
+
+
 def postprocess_draft(text: Optional[str]) -> Tuple[str, bool]:
     """Model output -> (draft text, skipped). ``SKIP`` (any case/punctuation) means no reply is needed."""
     text = (text or "").strip().translate(_KEYBOARD_ONLY)
     if text.strip(string.punctuation + " ").lower() == "skip":
         return "", True
-    return _capitalize_sentences(text), False
+    return _capitalize_sentences(_add_clause_commas(text)), False
 
 
 def postprocess_variants(text: Optional[str]) -> Tuple[List[str], bool]:
@@ -1283,9 +1303,11 @@ def _render_conversation(log: List[Dict[str, Any]], customer_name: str,
 
 def gist_prompt(log: List[Dict[str, Any]], customer_name: str, examples: List[Dict[str, Any]], gist: str) -> str:
     """The prompt that words the owner's gist (eval_persona.py reads the same function)."""
+    question = ("\nThe gist asks the contact a question: the reply asks it too, it does not answer it."
+                if "?" in gist else "")
     return (_render_conversation(log, customer_name, examples)
             + "\n\nThe owner's gist of his reply, in his own words (it may be terse or transcribed from "
-            f"voice): {' '.join(gist.split())}\nWrite his reply from this gist.")
+            f"voice): {' '.join(gist.split())}\nWrite his reply from this gist.{question}")
 
 
 def _customer_display_name(message: Any) -> str:

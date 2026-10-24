@@ -1689,6 +1689,25 @@ class TestDraftOutputCleanup:
         from telegram_business_plugin.manager import postprocess_draft
         assert postprocess_draft(raw) == (expected, False)
 
+    @pytest.mark.parametrize("raw, expected", [
+        ("Ок, напиши когда будешь на месте", "Ок, напиши, когда будешь на месте"),
+        ("напишу чтобы заходил", "Напишу, чтобы заходил"),
+        ("скину если что", "Скину, если что"),
+        ("Звони когда выйдешь", "Звони, когда выйдешь"),
+        ("и когда приедешь?", "И когда приедешь?"),            # after a conjunction: no comma
+        ("работает, даже когда сеть падает", "Работает, даже когда сеть падает"),
+        ("лучше чем когда было", "Лучше чем когда было"),
+        ("Оставь пока у себя", "Оставь пока у себя"),          # "пока" = for now
+        ("когда сможешь?", "Когда сможешь?"),
+        ("уже написал, когда смогу", "Уже написал, когда смогу"),
+        ("для того чтобы работало", "Для того чтобы работало"),
+        ("А второй когда будет готов?", "А второй когда будет готов?"),    # direct question
+        ("скинешь если есть?", "Скинешь, если есть?"),
+    ])
+    def test_a_comma_goes_before_a_subordinate_clause(self, raw, expected):
+        from telegram_business_plugin.manager import postprocess_draft
+        assert postprocess_draft(raw) == (expected, False)
+
     @pytest.mark.parametrize("output", ["SKIP", "skip.", " Skip ", "SKIP!"])
     @pytest.mark.asyncio
     async def test_skip_records_row_without_dm(self, db, output):
